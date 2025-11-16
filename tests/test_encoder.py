@@ -59,20 +59,24 @@ class TestEncoder:
         assert encoder is not None
         assert encoder._messages == messages
 
-    def test_encoder_write_to_file_not_implemented(self, temp_dir):
-        '''Tests that write_to_file raises NotImplementedError'''
+    def test_encoder_write_to_file_should_work(self, temp_dir):
+        '''Tests that write_to_file should work when implemented'''
         encoder = Encoder({})
         output_file = os.path.join(temp_dir, "test_output.fit")
         
-        with pytest.raises(NotImplementedError, match="Encoder.write_to_file\\(\\) is not yet implemented"):
-            encoder.write_to_file(output_file)
+        # TDD: This should work when implemented, for now it will fail
+        result = encoder.write_to_file(output_file)
+        assert result is True
+        assert os.path.exists(output_file)
 
-    def test_encoder_write_to_bytes_not_implemented(self):
-        '''Tests that write_to_bytes raises NotImplementedError'''
+    def test_encoder_write_to_bytes_should_work(self):
+        '''Tests that write_to_bytes should work when implemented'''
         encoder = Encoder({})
         
-        with pytest.raises(NotImplementedError, match="Encoder.write_to_bytes\\(\\) is not yet implemented"):
-            encoder.write_to_bytes()
+        # TDD: This should work when implemented, for now it will fail
+        result = encoder.write_to_bytes()
+        assert isinstance(result, bytearray)
+        assert len(result) > 0
 
     @pytest.mark.parametrize("fit_file", [
         "tests/fits/ActivityDevFields.fit",
@@ -110,13 +114,13 @@ class TestEncoder:
 
     @pytest.mark.parametrize("fit_file", [
         "tests/fits/ActivityDevFields.fit",
-        "tests/fits/HrmPluginTestActivity.fit",
+        "tests/fits/HrmPluginTestActivity.fit", 
         "tests/fits/WithGearChangeData.fit"
     ])
-    def test_round_trip_encoding_placeholder(self, fit_file, temp_dir):
+    def test_round_trip_encoding(self, fit_file, temp_dir):
         '''
-        Placeholder test for round-trip encoding (decode -> encode -> decode -> compare).
-        This test will be fully implemented once the encoder is working.
+        Test complete round-trip encoding: decode -> encode -> decode -> compare.
+        This is the core TDD test that drives encoder implementation.
         '''
         if not os.path.exists(fit_file):
             pytest.skip(f"Test file {fit_file} not found")
@@ -139,22 +143,35 @@ class TestEncoder:
         assert len(original_errors) == 0, f"Original decoding errors: {original_errors}"
         assert len(original_messages) > 0, "Original messages should not be empty"
         
-        # Step 2: Create encoder with decoded messages
+        # Step 2: Encode to new file - TDD: This should work when implemented
         encoder = Encoder(original_messages)
-        assert encoder is not None
-        
-        # Step 3: Attempt to encode (expect NotImplementedError for now)
         output_file = os.path.join(temp_dir, f"encoded_{os.path.basename(fit_file)}")
         
-        with pytest.raises(NotImplementedError):
-            encoder.write_to_file(output_file)
+        result = encoder.write_to_file(output_file)
+        assert result is True, "Encoder should return True on success"
+        assert os.path.exists(output_file), "Encoded file should exist"
+        assert os.path.getsize(output_file) > 0, "Encoded file should not be empty"
             
-        # TODO: Once encoder is implemented, continue with:
-        # - Verify encoded file exists and has correct size
-        # - Decode the newly encoded file  
-        # - Compare original_messages with re_decoded_messages
-        # - Verify all essential fields match
-        # - Verify file integrity of encoded file
+        # Step 3: Decode the newly encoded file
+        new_stream = Stream.from_file(output_file)
+        new_decoder = Decoder(new_stream)
+        
+        # Validate encoded file structure
+        new_stream.reset()
+        assert new_decoder.is_fit(), "Encoded file should be a valid FIT file"
+        
+        new_stream.reset()
+        assert new_decoder.check_integrity(), "Encoded file should pass integrity check"
+        
+        # Decode new messages
+        new_stream.reset()
+        new_messages, new_errors = new_decoder.read()
+        
+        assert len(new_errors) == 0, f"New file decoding errors: {new_errors}"
+        assert len(new_messages) > 0, "New messages should not be empty"
+        
+        # Step 4: Compare original vs re-decoded messages
+        self._compare_messages_deep(original_messages, new_messages)
 
     def test_message_structure_validation(self):
         '''Tests validation of message structure that will be passed to encoder'''
