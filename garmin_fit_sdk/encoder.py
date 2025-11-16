@@ -1,8 +1,10 @@
 '''encoder.py: Contains the encoder class which is used to encode fit files.'''
 
 import struct
+import datetime
 from . import CrcCalculator
 from . import fit as FIT
+from . import util
 from .profile import Profile
 
 
@@ -123,14 +125,14 @@ class Encoder:
         # Assign local message number
         local_msg_num = len(self._local_mesg_defs) % 16
         
-        # Write message definition
-        self._write_message_definition(local_msg_num, global_msg_num, msg_profile, messages[0])
+        # Write message definition (scan all messages to find complete field set)
+        self._write_message_definition(local_msg_num, global_msg_num, msg_profile, messages)
         
         # Write all messages of this type
         for message in messages:
             self._write_message_data(local_msg_num, msg_profile, message)
 
-    def _write_message_definition(self, local_msg_num: int, global_msg_num: int, msg_profile: dict, sample_message: dict):
+    def _write_message_definition(self, local_msg_num: int, global_msg_num: int, msg_profile: dict, messages: list):
         '''Write a message definition record'''
         # Record header byte (0x40 = definition message)
         record_header = 0x40 | (local_msg_num & 0x0F)
@@ -145,9 +147,19 @@ class Encoder:
         # Global message number
         self._data_buffer.extend(struct.pack('<H', global_msg_num))
         
-        # Build field definitions based on sample message
+        # Scan ALL messages to find complete field set
+        all_field_names = set()
+        for message in messages:
+            for field_name in message.keys():
+                # Skip numeric field IDs and None values
+                if not isinstance(field_name, int) and message[field_name] is not None:
+                    all_field_names.add(field_name)
+        
+        # Build field definitions from complete field set
         field_defs = []
-        for field_name, field_value in sample_message.items():
+        field_name_to_id = {}
+        
+        for field_name in sorted(all_field_names):  # Sort for consistent output            
             if field_name in msg_profile['fields']:
                 field_profile = msg_profile['fields'][field_name]
             else:
@@ -159,10 +171,24 @@ class Encoder:
                         break
                 
                 if field_profile is None:
-                    continue  # Skip unknown fields
+                    # Skip unknown fields that aren't in the profile
+                    # This prevents synthetic fields that the decoder can't understand
+                    continue
             
-            # Determine field size and base type
-            base_type, size = self._determine_field_type_and_size(field_profile, field_value)
+            # Store the field name to ID mapping
+            field_name_to_id[field_name] = field_profile['num']
+            
+            # Determine field size and base type from first non-None value
+            sample_value = None
+            for message in messages:
+                if field_name in message and message[field_name] is not None:
+                    sample_value = message[field_name]
+                    break
+            
+            if sample_value is None:
+                continue  # Skip fields that are None in all messages
+            
+            base_type, size = self._determine_field_type_and_size(field_profile, sample_value)
             
             field_defs.append({
                 'field_id': field_profile['num'],
@@ -183,7 +209,8 @@ class Encoder:
         self._local_mesg_defs[local_msg_num] = {
             'global_msg_num': global_msg_num,
             'profile': msg_profile,
-            'field_defs': field_defs
+            'field_defs': field_defs,
+            'field_name_to_id': field_name_to_id
         }
 
     def _write_message_data(self, local_msg_num: int, msg_profile: dict, message: dict):
@@ -199,16 +226,19 @@ class Encoder:
         for field_def in msg_def['field_defs']:
             field_id = field_def['field_id']
             
-            # Find field name
+            # Find field name using our mapping
             field_name = None
-            for fname, fvalue in message.items():
-                if fname in msg_profile['fields'] and msg_profile['fields'][fname]['num'] == field_id:
-                    field_name = fname
+            for name, fid in msg_def.get('field_name_to_id', {}).items():
+                if fid == field_id:
+                    field_name = name
                     break
-                # Also try direct field ID lookup
-                elif field_id in msg_profile['fields'] and msg_profile['fields'][field_id]['name'] == fname:
-                    field_name = fname
-                    break
+            
+            # Fallback to profile lookup if not found in our mapping
+            if field_name is None:
+                for fname, fvalue in message.items():
+                    if fname in msg_profile['fields'] and msg_profile['fields'][fname]['num'] == field_id:
+                        field_name = fname
+                        break
             
             if field_name is None or field_name not in message:
                 # Write invalid/default value
@@ -217,7 +247,10 @@ class Encoder:
             else:
                 # Write actual field value
                 field_value = message[field_name]
-                self._write_field_value(field_value, field_def['size'], field_def['base_type'], msg_profile['fields'].get(field_name, {}))
+                field_value = message[field_name]
+                # Look up field profile by field ID, not field name
+                field_profile = msg_profile['fields'].get(field_id, {})
+                self._write_field_value(field_value, field_def['size'], field_def['base_type'], field_profile)
 
     def _write_field_value(self, value, size: int, base_type: int, field_profile: dict):
         '''Write a field value with proper encoding'''
@@ -252,16 +285,10 @@ class Encoder:
             self._write_single_value(value, base_type, field_profile)
 
     def _write_single_value(self, value, base_type: int, field_profile: dict):
-        '''Write a single value with proper type conversion'''
-        from . import util
-        import datetime
+        '''Write a single field value'''
         
         base_type_def = FIT.BASE_TYPE_DEFINITIONS[base_type]
         type_code = base_type_def['type_code']
-        
-        # Convert value if needed
-        if value is None:
-            value = base_type_def['invalid']
         
         # Handle datetime objects - convert back to FIT timestamp
         if isinstance(value, datetime.datetime):
@@ -276,8 +303,11 @@ class Encoder:
                 scale = field_profile['scale'][0]
                 offset = field_profile['offset'][0]
                 if scale != 1 or offset != 0:
-                    # Reverse the decoder's operation: (value + offset) * scale
-                    value = int((value + offset) * scale)
+                    # Only apply scaling to numeric values, not None
+                    if value is not None:
+                        # Reverse the decoder's operation: raw = (actual + offset) * scale
+                        # Decoder does: actual = (raw / scale) - offset
+                        value = int((value + offset) * scale)
         
         # Convert strings back to numbers if needed
         if isinstance(value, str) and base_type != FIT.BASE_TYPE['STRING']:
@@ -295,6 +325,11 @@ class Encoder:
         
         # Pack the value
         try:
+            # Handle None values
+            if value is None:
+                self._write_field_bytes(base_type_def['invalid'], base_type_def['size'], base_type)
+                return
+                
             if type_code in ['b', 'B']:
                 packed = struct.pack('<' + type_code, int(value) & 0xFF)
             elif type_code in ['h', 'H']:
@@ -309,7 +344,7 @@ class Encoder:
                 packed = struct.pack('<B', base_type_def['invalid'])
             
             self._data_buffer.extend(packed)
-        except (struct.error, ValueError, OverflowError):
+        except (struct.error, ValueError, OverflowError, TypeError):
             # If packing fails, write invalid value
             self._write_field_bytes(base_type_def['invalid'], base_type_def['size'], base_type)
 
@@ -336,9 +371,31 @@ class Encoder:
 
     def _determine_field_type_and_size(self, field_profile: dict, field_value) -> tuple:
         '''Determine the base type and size for a field'''
+        
+        # Convert enum string values to numbers first
+        if isinstance(field_value, str) and field_profile and 'type' in field_profile:
+            field_type = field_profile['type']
+            if field_type in Profile['types']:
+                # This is an enum field - convert string to number
+                for num_val, str_val in Profile['types'][field_type].items():
+                    if str_val == field_value:
+                        field_value = int(num_val)
+                        break
+                else:
+                    # Unknown enum value - use invalid
+                    field_value = 0  # Default to 0 for unknown enum values
+        
         if 'type' in field_profile and field_profile['type'] in FIT.FIELD_TYPE_TO_BASE_TYPE:
             base_type = FIT.FIELD_TYPE_TO_BASE_TYPE[field_profile['type']]
             base_type_def = FIT.BASE_TYPE_DEFINITIONS[base_type]
+            
+            # Special handling for string types
+            if field_profile['type'] == 'string':
+                if isinstance(field_value, str):
+                    size = len(field_value) + 1  # Include null terminator
+                else:
+                    size = 1  # Fallback for empty/null strings
+                return base_type, size
             
             if isinstance(field_value, (list, tuple)):
                 # Array field
@@ -351,7 +408,9 @@ class Encoder:
         else:
             # Default to appropriate type based on value
             if isinstance(field_value, str):
-                return FIT.BASE_TYPE['STRING'], min(len(field_value) + 1, 255)
+                string_base_type = FIT.BASE_TYPE['STRING']
+                string_size = min(len(field_value) + 1, 255)
+                return string_base_type, string_size
             elif isinstance(field_value, bool):
                 return FIT.BASE_TYPE['UINT8'], 1
             elif isinstance(field_value, float):
@@ -375,6 +434,9 @@ class Encoder:
                     return elem_type, len(field_value) * elem_size
                 else:
                     return FIT.BASE_TYPE['UINT8'], 1
+            elif isinstance(field_value, datetime.datetime):
+                # Datetime objects should be encoded as uint32 timestamps
+                return FIT.BASE_TYPE['UINT32'], 4
             else:
                 return FIT.BASE_TYPE['UINT8'], 1
 

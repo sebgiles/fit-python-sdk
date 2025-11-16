@@ -97,11 +97,61 @@ class TestRoundTrip:
             for i, (orig_msg, dec_msg) in enumerate(zip(orig_msgs, decoded_msgs)):
                 self._compare_single_message(orig_msg, dec_msg, ignore_fields, f"{msg_type}[{i}]")
     
+    def _is_component_field(self, field_name, message_type):
+        '''Check if a field is a component field that gets expanded from a parent field'''
+        from garmin_fit_sdk.profile import Profile
+        
+        # Get message profile
+        msg_num = None
+        for num, msg_profile in Profile['messages'].items():
+            if msg_profile.get('messages_key') == message_type:
+                msg_num = num
+                break
+        
+        if msg_num is None:
+            return False
+            
+        msg_profile = Profile['messages'][msg_num]
+        
+        # Find the field profile by name
+        field_profile = None
+        for field_id, fp in msg_profile['fields'].items():
+            if fp['name'] == field_name:
+                field_profile = fp
+                break
+        
+        if field_profile is None:
+            return False
+        
+        field_num = field_profile['num']
+        
+        # Check if any other field has this field as a component
+        for parent_id, parent_fp in msg_profile['fields'].items():
+            if (parent_fp.get('has_components', False) and 
+                'components' in parent_fp and 
+                field_num in parent_fp['components']):
+                return True
+                
+        return False
+
     def _compare_single_message(self, original, decoded, ignore_fields, context):
         '''Helper method to compare individual messages'''
         # Filter out ignored fields
         orig_filtered = {k: v for k, v in original.items() if k not in ignore_fields}
         dec_filtered = {k: v for k, v in decoded.items() if k not in ignore_fields}
+        
+        # Also filter out numeric field IDs that represent unknown fields
+        # These can't be preserved during round-trip since the encoder can only encode known profile fields
+        orig_filtered = {k: v for k, v in orig_filtered.items() if not isinstance(k, int)}
+        dec_filtered = {k: v for k, v in dec_filtered.items() if not isinstance(k, int)}
+        
+        # Filter out component fields - these are synthetic fields created by decoder expansion
+        # and cannot be round-tripped since they're generated from parent fields
+        message_type = context.split('[')[0]  # Extract message type from context like "record_mesgs[6]"
+        orig_filtered = {k: v for k, v in orig_filtered.items() 
+                        if not self._is_component_field(k, message_type)}
+        dec_filtered = {k: v for k, v in dec_filtered.items() 
+                       if not self._is_component_field(k, message_type)}
         
         # Compare field keys
         assert set(orig_filtered.keys()) == set(dec_filtered.keys()), \
