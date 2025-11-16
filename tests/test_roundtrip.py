@@ -179,7 +179,7 @@ class TestRoundTrip:
             assert orig_value == dec_value, \
                 f"Field {field} differs in {context}: {orig_value} vs {dec_value}"
     
-    def _are_values_approximately_equal(self, val1, val2, rtol=1e-2, atol=1e-3):
+    def _are_values_approximately_equal(self, val1, val2, rtol=0, atol=0):
         '''Check if two values are approximately equal, handling floats and arrays'''
         import math
         
