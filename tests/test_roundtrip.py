@@ -147,11 +147,6 @@ class TestRoundTrip:
         orig_filtered = {k: v for k, v in original.items() if k not in ignore_fields}
         dec_filtered = {k: v for k, v in decoded.items() if k not in ignore_fields}
         
-        # Also filter out numeric field IDs that represent unknown fields
-        # These can't be preserved during round-trip since the encoder can only encode known profile fields
-        orig_filtered = {k: v for k, v in orig_filtered.items() if not isinstance(k, int)}
-        dec_filtered = {k: v for k, v in dec_filtered.items() if not isinstance(k, int)}
-        
         # Filter out component fields - these are synthetic fields created by decoder expansion
         # and cannot be round-tripped since they're generated from parent fields
         message_type = context.split('[')[0]  # Extract message type from context like "record_mesgs[6]"
