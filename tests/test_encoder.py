@@ -64,7 +64,6 @@ class TestEncoder:
         encoder = Encoder({})
         output_file = os.path.join(temp_dir, "test_output.fit")
         
-        # TDD: This should work when implemented, for now it will fail
         result = encoder.write_to_file(output_file)
         assert result is True
         assert os.path.exists(output_file)
@@ -73,7 +72,6 @@ class TestEncoder:
         '''Tests that write_to_bytes should work when implemented'''
         encoder = Encoder({})
         
-        # TDD: This should work when implemented, for now it will fail
         result = encoder.write_to_bytes()
         assert isinstance(result, bytearray)
         assert len(result) > 0
@@ -120,7 +118,6 @@ class TestEncoder:
     def test_round_trip_encoding(self, fit_file, temp_dir):
         '''
         Test complete round-trip encoding: decode -> encode -> decode -> compare.
-        This is the core TDD test that drives encoder implementation.
         '''
         if not os.path.exists(fit_file):
             pytest.skip(f"Test file {fit_file} not found")
@@ -143,7 +140,7 @@ class TestEncoder:
         assert len(original_errors) == 0, f"Original decoding errors: {original_errors}"
         assert len(original_messages) > 0, "Original messages should not be empty"
         
-        # Step 2: Encode to new file - TDD: This should work when implemented
+        # Step 2: Encode to new file
         encoder = Encoder(original_messages)
         output_file = os.path.join(temp_dir, f"encoded_{os.path.basename(fit_file)}")
         
