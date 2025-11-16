@@ -100,7 +100,7 @@ class Encoder:
         '''Write all messages to the data buffer'''
         # Write file_id message first (required by FIT spec)
         if 'file_id_mesgs' in self._messages:
-            self._write_message_type('file_id_mesgs', 0)
+            self._write_message_type(0, self._messages['file_id_mesgs'])
         
         # Write all other message types
         for msg_type, messages in self._messages.items():
@@ -108,32 +108,53 @@ class Encoder:
                 # Look up global message number from profile
                 global_msg_num = self._get_global_message_number(msg_type)
                 if global_msg_num is not None:
-                    self._write_message_type(msg_type, global_msg_num)
+                    self._write_message_type(global_msg_num, messages)
 
-    def _write_message_type(self, msg_type: str, global_msg_num: int):
-        '''Write all messages of a specific type'''
-        messages = self._messages[msg_type]
-        if not messages:
-            return
-            
-        # Get message definition from profile
-        if global_msg_num in Profile['messages']:
-            msg_profile = Profile['messages'][global_msg_num]
-        else:
-            return  # Skip unknown message types for now
+    def _write_message_type(self, message_type_num: int, messages: list):
+        '''Write all messages of a specific type, creating individual definitions for each unique field set'''
+        msg_profile = Profile['messages'][message_type_num]
+        global_msg_num = message_type_num
         
-        # Assign local message number
-        local_msg_num = len(self._local_mesg_defs) % 16
+        # Track which messages we've processed with each definition
+        definition_cache = {}  # field_set_hash -> local_msg_num
         
-        # Write message definition (scan all messages to find complete field set)
-        self._write_message_definition(local_msg_num, global_msg_num, msg_profile, messages)
-        
-        # Write all messages of this type
         for message in messages:
+            # Skip 'mesg_num' as it's metadata
+            message_fields = set(field for field in message.keys() if field != 'mesg_num')
+            
+            # Create a hash of the field set to identify identical field combinations
+            field_set_hash = hash(frozenset(message_fields))
+            
+            if field_set_hash in definition_cache:
+                # Reuse existing definition
+                local_msg_num = definition_cache[field_set_hash]
+            else:
+                # Create a new definition for this field combination
+                local_msg_num = len(self._local_mesg_defs) % 16
+                definition_cache[field_set_hash] = local_msg_num
+                
+                # Write message definition for this specific field combination
+                self._write_specific_message_definition(local_msg_num, global_msg_num, msg_profile, message_fields, message)
+            
+            # Write the message data using the appropriate definition
             self._write_message_data(local_msg_num, msg_profile, message)
 
-    def _write_message_definition(self, local_msg_num: int, global_msg_num: int, msg_profile: dict, messages: list):
-        '''Write a message definition record'''
+    def _get_message_field_pattern(self, message: dict) -> frozenset:
+        '''Get field pattern for a message to enable grouping by field combinations'''
+        return pattern_groups
+    
+    def _get_message_field_pattern(self, message: dict) -> frozenset:
+        '''Get the field pattern (signature) for a message'''
+        # Create a signature based on non-null field names (excluding numeric field IDs)
+        field_names = set()
+        for field_name, field_value in message.items():
+            if not isinstance(field_name, int) and field_value is not None:
+                field_names.add(field_name)
+        
+        return frozenset(field_names)
+
+    def _write_message_definition(self, local_msg_num: int, global_msg_num: int, msg_profile: dict, pattern_messages: list):
+        '''Write a message definition record for a specific field pattern'''
         # Record header byte (0x40 = definition message)
         record_header = 0x40 | (local_msg_num & 0x0F)
         self._data_buffer.append(record_header)
@@ -147,19 +168,19 @@ class Encoder:
         # Global message number
         self._data_buffer.extend(struct.pack('<H', global_msg_num))
         
-        # Scan ALL messages to find complete field set
-        all_field_names = set()
-        for message in messages:
-            for field_name in message.keys():
-                # Skip numeric field IDs and None values
-                if not isinstance(field_name, int) and message[field_name] is not None:
-                    all_field_names.add(field_name)
+        # Use the field pattern from the first message in this group
+        # All messages in pattern_messages have the same field pattern
+        sample_message = pattern_messages[0]
+        field_names = [name for name, value in sample_message.items() 
+                      if not isinstance(name, int) and value is not None]
         
-        # Build field definitions from complete field set
+        # Build field definitions for this specific pattern
         field_defs = []
         field_name_to_id = {}
         
-        for field_name in sorted(all_field_names):  # Sort for consistent output            
+        print(f"DEBUG: Creating definition for pattern with {len(field_names)} fields: {sorted(field_names)}")
+        
+        for field_name in sorted(field_names):  # Sort for consistent output            
             if field_name in msg_profile['fields']:
                 field_profile = msg_profile['fields'][field_name]
             else:
@@ -173,21 +194,14 @@ class Encoder:
                 if field_profile is None:
                     # Skip unknown fields that aren't in the profile
                     # This prevents synthetic fields that the decoder can't understand
+                    print(f"DEBUG: Skipping unknown field {field_name}")
                     continue
             
             # Store the field name to ID mapping
             field_name_to_id[field_name] = field_profile['num']
             
-            # Determine field size and base type from first non-None value
-            sample_value = None
-            for message in messages:
-                if field_name in message and message[field_name] is not None:
-                    sample_value = message[field_name]
-                    break
-            
-            if sample_value is None:
-                continue  # Skip fields that are None in all messages
-            
+            # Determine field size and base type from sample message
+            sample_value = sample_message[field_name]
             base_type, size = self._determine_field_type_and_size(field_profile, sample_value)
             
             field_defs.append({
@@ -195,6 +209,8 @@ class Encoder:
                 'size': size,
                 'base_type': base_type
             })
+        
+        print(f"DEBUG: Created {len(field_defs)} field definitions for local message {local_msg_num}")
         
         # Number of fields
         self._data_buffer.append(len(field_defs))
@@ -213,6 +229,96 @@ class Encoder:
             'field_name_to_id': field_name_to_id
         }
 
+    def _write_specific_message_definition(self, local_msg_num: int, global_msg_num: int, msg_profile, message_fields: set, sample_message: dict):
+        '''Write a message definition for a specific set of fields'''
+        # Definition header: 0100xxxx where xxxx is local message number
+        definition_header = 0x40 | (local_msg_num & 0x0F)
+        self._data_buffer.append(definition_header)
+        
+        # Reserved byte
+        self._data_buffer.append(0)
+        
+        # Architecture
+        self._data_buffer.append(0)  # Definition & Data Messages are little endian
+        
+        # Global message number (2 bytes, little endian)
+        self._data_buffer.extend(struct.pack('<H', global_msg_num))
+        
+        # Create field definitions for the specific fields in this message
+        field_defs = []
+        field_name_to_id = {}
+        
+        # Use the sample message values for type determination
+        sample_values = sample_message
+        
+        # Separate string field names from numeric developer field numbers  
+        string_fields = [f for f in message_fields if isinstance(f, str)]
+        numeric_fields = [f for f in message_fields if isinstance(f, int)]
+        
+        # Process string fields first (regular fields)
+        for field_name in sorted(string_fields):  # Sort for consistent output            
+            if 'fields' in msg_profile:
+                # Look for field by name in the fields dict
+                field_profile = None
+                for field_info in msg_profile['fields'].values():
+                    if field_info['name'] == field_name:
+                        field_profile = field_info
+                        break
+                
+                if field_profile is not None:
+                    field_id = field_profile['num']
+                    field_name_to_id[field_name] = field_id
+                    
+                    # Determine base type and size using existing method
+                    sample_value = sample_values.get(field_name)
+                    if sample_value is not None:
+                        base_type, size = self._determine_field_type_and_size(field_profile, sample_value)
+                    else:
+                        # Fallback to reasonable defaults based on field type
+                        fit_type = field_profile.get('type', 'uint8')
+                        if fit_type == 'string':
+                            base_type, size = FIT.BASE_TYPE['STRING'], 1
+                        elif fit_type in FIT.BASE_TYPE:
+                            base_type = FIT.BASE_TYPE[fit_type]
+                            size = 1  # Default size
+                        else:
+                            base_type, size = FIT.BASE_TYPE['UINT8'], 1
+                    
+                    field_defs.append({
+                        'field_id': field_id,
+                        'size': size,
+                        'base_type': base_type
+                    })
+        
+        # Process numeric fields (developer fields)
+        for field_num in sorted(numeric_fields):
+            # Find a sample value to determine type and size
+            sample_value = sample_values.get(field_num)
+            if sample_value is not None:
+                base_type, size = self._determine_field_type_and_size(None, sample_value)
+                field_defs.append({
+                    'field_id': field_num,
+                    'size': size, 
+                    'base_type': base_type
+                })
+                field_name_to_id[field_num] = field_num
+        
+        # Number of fields (1 byte)
+        self._data_buffer.append(len(field_defs))
+        
+        # Field definitions (3 bytes each)
+        for field_def in field_defs:
+            self._data_buffer.append(field_def['field_id'])  # Field definition number
+            self._data_buffer.append(field_def['size'])       # Size in bytes
+            self._data_buffer.append(field_def['base_type'])  # Base type
+        
+        # Store the definition for later use when writing message data
+        self._local_mesg_defs[local_msg_num] = {
+            'global_msg_num': global_msg_num,
+            'field_defs': field_defs,
+            'field_name_to_id': field_name_to_id
+        }
+
     def _write_message_data(self, local_msg_num: int, msg_profile: dict, message: dict):
         '''Write a message data record'''
         # Record header (normal message)
@@ -222,7 +328,7 @@ class Encoder:
         # Get field definitions
         msg_def = self._local_mesg_defs[local_msg_num]
         
-        # Write field data in the order defined in the message definition
+            # Write field data in the order defined in the message definition
         for field_def in msg_def['field_defs']:
             field_id = field_def['field_id']
             
@@ -246,7 +352,6 @@ class Encoder:
                 self._write_field_bytes(invalid_value, field_def['size'], field_def['base_type'])
             else:
                 # Write actual field value
-                field_value = message[field_name]
                 field_value = message[field_name]
                 # Look up field profile by field ID, not field name
                 field_profile = msg_profile['fields'].get(field_id, {})
@@ -371,6 +476,33 @@ class Encoder:
 
     def _determine_field_type_and_size(self, field_profile: dict, field_value) -> tuple:
         '''Determine the base type and size for a field'''
+        
+        # Handle developer fields (when field_profile is None)
+        if field_profile is None:
+            # For developer fields, infer type from the value
+            if isinstance(field_value, str):
+                size = len(field_value) + 1  # Include null terminator
+                return FIT.BASE_TYPE['STRING'], size
+            elif isinstance(field_value, bool):
+                return FIT.BASE_TYPE['ENUM'], 1
+            elif isinstance(field_value, int):
+                if -128 <= field_value <= 127:
+                    return FIT.BASE_TYPE['SINT8'], 1
+                elif 0 <= field_value <= 255:
+                    return FIT.BASE_TYPE['UINT8'], 1
+                elif -32768 <= field_value <= 32767:
+                    return FIT.BASE_TYPE['SINT16'], 2
+                elif 0 <= field_value <= 65535:
+                    return FIT.BASE_TYPE['UINT16'], 2
+                elif -2147483648 <= field_value <= 2147483647:
+                    return FIT.BASE_TYPE['SINT32'], 4
+                else:
+                    return FIT.BASE_TYPE['UINT32'], 4
+            elif isinstance(field_value, float):
+                return FIT.BASE_TYPE['FLOAT32'], 4
+            else:
+                # Default fallback
+                return FIT.BASE_TYPE['UINT8'], 1
         
         # Convert enum string values to numbers first
         if isinstance(field_value, str) and field_profile and 'type' in field_profile:
