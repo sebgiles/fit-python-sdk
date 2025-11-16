@@ -72,36 +72,17 @@ class TestRoundTrip:
         
         # Decode new messages
         new_stream.reset()
-        new_messages, new_errors = new_decoder.read(preserve_invalid_values=True)
-
-        # Handle known decoder issues with specific files
-        if "HrmPluginTestActivity.fit" in fit_file and len(new_errors) > 0:
-            # This specific file has known decoder issues due to complex field patterns
-            # that create valid FIT data but trigger decoder edge cases.
-            # For now, we'll accept that our encoder creates valid files even if 
-            # the decoder has issues with complex patterns.
-            print(f"Note: {fit_file} has known decoder interaction issues: {new_errors}")
-            return  # Skip the data comparison for this specific case
+        new_messages, new_errors = new_decoder.read(
+            preserve_invalid_values=True,
+            merge_heart_rates=False  # Disable heart rate merging for exact roundtrip
+        )
 
         assert len(new_errors) == 0, f"New file decoding errors: {new_errors}"
         assert len(new_messages) > 0, "New messages should not be empty"
         
         # Step 4: Compare original vs re-decoded messages
-        # Ignore problematic fields that have known encoding issues
-        ignore_fields = [
-            # Power phase arrays - FIXED! Scaling formula corrected
-            # 'left_power_phase',
-            # 'right_power_phase',
-            # 'left_power_phase_peak',
-            # 'right_power_phase_peak',
-            'altitude',  # Invalid value handling issue (-127 preservation)
-            'enhanced_altitude',  # Related to altitude invalid values
-            'left_right_balance',  # Field encoding issues
-            # 'event_group',  # Event field encoding issues - TBD
-            'manufacturer',  # File ID field issues
-            'developer_fields',  # Developer field encoding not implemented
-        ]
-        self._compare_messages_deep(original_messages, new_messages, ignore_fields)
+        # Perfect roundtrip comparison with zero tolerance
+        self._compare_messages_deep(original_messages, new_messages)
 
     def _compare_messages_deep(self, original, decoded, ignore_fields=None):
         '''

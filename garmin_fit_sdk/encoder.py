@@ -275,7 +275,76 @@ class Encoder:
         numeric_fields = [f for f in message_fields if isinstance(f, int)]
         
         # Process string fields first (regular fields)
-        for field_name in sorted(string_fields):  # Sort for consistent output            
+        for field_name in sorted(string_fields):  # Sort for consistent output
+            # Special handling for developer_fields
+            if field_name == 'developer_fields':
+                # Developer fields are stored as {field_id: value} dict
+                dev_fields_dict = sample_values.get('developer_fields', {})
+                if isinstance(dev_fields_dict, dict):
+                    for dev_field_id, dev_value in dev_fields_dict.items():
+                        if dev_value is not None:
+                            # Use the developer field ID directly if it doesn't conflict
+                            # with profile field IDs. Profile field IDs for this message type
+                            # are already collected in field_name_to_id, so check for conflicts.
+                            mapped_field_id = dev_field_id
+                            
+                            # If there's a conflict, find a free field ID
+                            used_ids = set(field_name_to_id.values())
+                            used_ids.update([fd['field_id'] for fd in field_defs])
+                            
+                            while mapped_field_id in used_ids and mapped_field_id < 255:
+                                mapped_field_id += 1
+                            
+                            if mapped_field_id > 255:
+                                print(f"WARNING: Cannot find free field ID for developer field {dev_field_id}")
+                                continue
+                                
+                            # Determine type and size from the value
+                            if isinstance(dev_value, str):
+                                base_type, size = FIT.BASE_TYPE['STRING'], len(dev_value.encode('utf-8')) + 1
+                            elif isinstance(dev_value, bool):
+                                base_type, size = FIT.BASE_TYPE['ENUM'], 1
+                            elif isinstance(dev_value, int):
+                                if -128 <= dev_value <= 127:
+                                    base_type, size = FIT.BASE_TYPE['SINT8'], 1
+                                elif 0 <= dev_value <= 255:
+                                    base_type, size = FIT.BASE_TYPE['UINT8'], 1
+                                elif -32768 <= dev_value <= 32767:
+                                    base_type, size = FIT.BASE_TYPE['SINT16'], 2
+                                elif 0 <= dev_value <= 65535:
+                                    base_type, size = FIT.BASE_TYPE['UINT16'], 2
+                                elif -2147483648 <= dev_value <= 2147483647:
+                                    base_type, size = FIT.BASE_TYPE['SINT32'], 4
+                                else:
+                                    base_type, size = FIT.BASE_TYPE['UINT32'], 4
+                            elif isinstance(dev_value, float):
+                                base_type, size = FIT.BASE_TYPE['FLOAT32'], 4
+                            elif isinstance(dev_value, list):
+                                # Handle arrays - use first non-None element for type determination
+                                sample_element = None
+                                for elem in dev_value:
+                                    if elem is not None:
+                                        sample_element = elem
+                                        break
+                                if sample_element is not None:
+                                    element_base_type, element_size = self._determine_field_type_and_size(None, sample_element)
+                                    size = len(dev_value) * FIT.BASE_TYPE_DEFINITIONS[element_base_type]['size']
+                                    base_type = element_base_type
+                                else:
+                                    base_type, size = FIT.BASE_TYPE['UINT8'], 1
+                            else:
+                                base_type, size = FIT.BASE_TYPE['UINT8'], 1
+                            
+                            field_defs.append({
+                                'field_id': mapped_field_id,
+                                'size': size,
+                                'base_type': base_type,
+                                'original_dev_field_id': dev_field_id  # Store for reverse mapping
+                            })
+                            # Map for writing values later
+                            field_name_to_id[f'developer_field_{dev_field_id}'] = mapped_field_id
+                continue
+            
             if 'fields' in msg_profile:
                 # Look for field by name in the fields dict
                 field_profile = None
@@ -377,6 +446,21 @@ class Encoder:
                     field_name = name
                     break
             
+            # Check if this is a developer field
+            if field_name and field_name.startswith('developer_field_'):
+                # Extract developer field ID and get value from developer_fields dict
+                dev_field_id = int(field_name.split('_')[-1])
+                developer_fields = message.get('developer_fields', {})
+                if dev_field_id in developer_fields:
+                    field_value = developer_fields[dev_field_id]
+                    pass  # Developer field processing
+                    self._write_field_value(field_value, field_def['size'], field_def['base_type'], {})
+                else:
+                    # Write invalid/default value for missing developer field
+                    invalid_value = FIT.BASE_TYPE_DEFINITIONS[field_def['base_type']]['invalid']
+                    self._write_field_bytes(invalid_value, field_def['size'], field_def['base_type'])
+                continue
+            
             # Fallback to profile lookup if not found in our mapping
             if field_name is None:
                 for fname, fvalue in message.items():
@@ -457,8 +541,8 @@ class Encoder:
                             # For zero offset: decoder = raw / scale, so encoder = actual * scale
                             value = round(value * scale)
                         else:
-                            # For non-zero offset: decoder = (raw / scale) + offset, so encoder = (actual - offset) * scale
-                            value = round((value - offset) * scale)
+                            # For non-zero offset: decoder = (raw / scale) - offset, so encoder = (actual + offset) * scale
+                            value = round((value + offset) * scale)
         
         # Convert strings back to numbers if needed
         if isinstance(value, str) and base_type != FIT.BASE_TYPE['STRING']:
