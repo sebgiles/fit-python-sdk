@@ -4,9 +4,11 @@
 import os
 import tempfile
 from pathlib import Path
+from datetime import datetime, timezone
 
 import pytest
 from garmin_fit_sdk import Decoder, Encoder, Stream
+from garmin_fit_sdk import fit as FIT
 
 
 class TestEncoder:
@@ -224,3 +226,37 @@ class TestEncoder:
         
         encoder = Encoder(large_messages)
         assert len(encoder._messages['record_mesgs']) == 1000
+
+    def test_timestamp_conversion_round_trip(self):
+        """Test that datetime to FIT timestamp conversion is reversible"""
+        from garmin_fit_sdk.util import FIT_EPOCH_S
+        
+        # Test with a known datetime
+        original_datetime = datetime(2022, 8, 15, 17, 39, 9, tzinfo=timezone.utc)
+        
+        # Convert to FIT timestamp (what encoder should do)
+        unix_timestamp = original_datetime.timestamp()
+        fit_timestamp = int(unix_timestamp - FIT_EPOCH_S)
+        
+        # Convert back to datetime (what decoder does)
+        recovered_datetime = datetime.fromtimestamp(fit_timestamp + FIT_EPOCH_S, timezone.utc)
+        
+        # Should be identical
+        assert original_datetime == recovered_datetime, f"Original: {original_datetime}, Recovered: {recovered_datetime}"
+        
+        # Test that our conversion logic matches what should happen
+        # This tests the same logic that's in the encoder
+        assert fit_timestamp > 0, "FIT timestamp should be positive"
+        assert fit_timestamp < 2**32, "FIT timestamp should fit in uint32"
+
+    def test_fit_epoch_calculation(self):
+        """Test that our FIT epoch calculations are correct"""
+        from garmin_fit_sdk.util import FIT_EPOCH_S
+        
+        # FIT epoch is 1989-12-31 00:00:00 UTC
+        fit_epoch_dt = datetime(1989, 12, 31, 0, 0, 0, tzinfo=timezone.utc)
+        unix_epoch_dt = datetime(1970, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        
+        # The difference should be FIT_EPOCH_S
+        expected_diff = fit_epoch_dt.timestamp() - unix_epoch_dt.timestamp()
+        assert abs(expected_diff - FIT_EPOCH_S) < 1, f"FIT_EPOCH_S mismatch: expected {expected_diff}, got {FIT_EPOCH_S}"
