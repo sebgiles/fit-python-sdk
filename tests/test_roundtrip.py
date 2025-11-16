@@ -42,7 +42,10 @@ class TestRoundTrip:
         
         # Decode original messages
         original_stream.reset()
-        original_messages, original_errors = original_decoder.read(preserve_invalid_values=True)
+        original_messages, original_errors = original_decoder.read(
+            preserve_invalid_values=True,
+            merge_heart_rates=False  # Disable heart rate merging for exact roundtrip
+        )
         
         assert len(original_errors) == 0, f"Original decoding errors: {original_errors}"
         assert len(original_messages) > 0, "Original messages should not be empty"
