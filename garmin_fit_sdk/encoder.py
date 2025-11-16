@@ -17,12 +17,18 @@ class Encoder:
     '''
 
     def __init__(self, messages: dict):
+        '''Initialize encoder with messages to encode.
+        
+        Args:
+            messages: dict mapping message type names to lists of message dicts
+        '''
         if messages is None:
             raise RuntimeError("FIT Runtime Error messages parameter is None.")
         
         self._messages = messages
-        self._local_mesg_defs = {}  # Track message definitions we've written
         self._data_buffer = bytearray()
+        self._local_mesg_defs = {}  # local_msg_num -> definition info
+        self._next_local_msg_num = 0  # Track next available local message number
 
     def write_to_file(self, filename: str) -> bool:
         '''
@@ -112,7 +118,13 @@ class Encoder:
 
     def _write_message_type(self, message_type_num: int, messages: list):
         '''Write all messages of a specific type, creating individual definitions for each unique field set'''
-        msg_profile = Profile['messages'][message_type_num]
+        # Check if this is a known message type with profile info
+        if message_type_num in Profile['messages']:
+            msg_profile = Profile['messages'][message_type_num]
+        else:
+            # Unknown message type - create a dynamic profile from field data
+            msg_profile = self._create_dynamic_profile(message_type_num, messages)
+        
         global_msg_num = message_type_num
         
         # Track which messages we've processed with each definition
@@ -129,8 +141,16 @@ class Encoder:
                 # Reuse existing definition
                 local_msg_num = definition_cache[field_set_hash]
             else:
-                # Create a new definition for this field combination
-                local_msg_num = len(self._local_mesg_defs) % 16
+                # Get next available local message number
+                if self._next_local_msg_num >= 16:
+                    # FIT protocol limitation: only 16 local message definitions allowed
+                    # We'll have to reuse slots, which may cause some data loss
+                    print(f"WARNING: Exceeded 16 local message definitions, reusing slot {self._next_local_msg_num % 16}")
+                    local_msg_num = self._next_local_msg_num % 16
+                else:
+                    local_msg_num = self._next_local_msg_num
+                
+                self._next_local_msg_num += 1
                 definition_cache[field_set_hash] = local_msg_num
                 
                 # Write message definition for this specific field combination
@@ -178,7 +198,7 @@ class Encoder:
         field_defs = []
         field_name_to_id = {}
         
-        print(f"DEBUG: Creating definition for pattern with {len(field_names)} fields: {sorted(field_names)}")
+        print(f"Creating definition for pattern with {len(field_names)} fields")
         
         for field_name in sorted(field_names):  # Sort for consistent output            
             if field_name in msg_profile['fields']:
@@ -194,7 +214,6 @@ class Encoder:
                 if field_profile is None:
                     # Skip unknown fields that aren't in the profile
                     # This prevents synthetic fields that the decoder can't understand
-                    print(f"DEBUG: Skipping unknown field {field_name}")
                     continue
             
             # Store the field name to ID mapping
@@ -615,7 +634,90 @@ class Encoder:
 
     def _get_global_message_number(self, msg_type: str) -> int:
         '''Get the global message number for a message type'''
+        # Check if msg_type is already a numeric string (unknown message type)
+        if msg_type.isdigit():
+            return int(msg_type)
+            
+        # Look up known message types in profile
         for global_num, msg_info in Profile['messages'].items():
             if msg_info.get('messages_key') == msg_type:
                 return global_num
         return None
+
+    def _create_dynamic_profile(self, message_type_num: int, messages: list):
+        '''Create a dynamic profile for unknown message types by analyzing field data'''
+        # Collect all field numbers used across all messages of this type
+        all_field_nums = set()
+        field_value_examples = {}
+        
+        for message in messages:
+            for field_num, value in message.items():
+                if field_num != 'mesg_num':  # Skip metadata
+                    all_field_nums.add(field_num)
+                    if field_num not in field_value_examples:
+                        field_value_examples[field_num] = value
+        
+        # Create dynamic field definitions
+        fields = {}
+        for field_num in all_field_nums:
+            example_value = field_value_examples[field_num]
+            
+            # Infer field type from value
+            if isinstance(example_value, str):
+                field_type = 'string'
+                field_size = len(example_value.encode('utf-8')) + 1  # +1 for null terminator
+            elif isinstance(example_value, int):
+                if -128 <= example_value <= 127:
+                    field_type = 'sint8'
+                    field_size = 1
+                elif 0 <= example_value <= 255:
+                    field_type = 'uint8'
+                    field_size = 1
+                elif -32768 <= example_value <= 32767:
+                    field_type = 'sint16'
+                    field_size = 2
+                elif 0 <= example_value <= 65535:
+                    field_type = 'uint16'
+                    field_size = 2
+                else:
+                    field_type = 'uint32'
+                    field_size = 4
+            elif isinstance(example_value, float):
+                field_type = 'float32'
+                field_size = 4
+            elif isinstance(example_value, (list, tuple)):
+                # Array field - use first element to determine type
+                if example_value and isinstance(example_value[0], int):
+                    field_type = 'uint8'  # Default for arrays
+                    field_size = len(example_value)
+                else:
+                    field_type = 'uint8'
+                    field_size = 4  # Default size
+            else:
+                # Default fallback
+                field_type = 'uint8'
+                field_size = 1
+            
+            fields[field_num] = {
+                'num': field_num,
+                'name': f'field_{field_num}',
+                'type': field_type,
+                'array': 'false',
+                'scale': [1],
+                'offset': [0],
+                'units': '',
+                'bits': [],
+                'components': [],
+                'is_accumulated': False,
+                'has_components': False,
+                'sub_fields': [],
+                'size': field_size
+            }
+        
+        # Create the dynamic profile
+        return {
+            'num': str(message_type_num),
+            'name': f'unknown_{message_type_num}',
+            'messages_key': str(message_type_num),
+            'fields': fields
+        }

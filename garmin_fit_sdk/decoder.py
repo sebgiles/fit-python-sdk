@@ -67,6 +67,7 @@ class Decoder:
         self._expand_sub_fields = True
         self._expand_components = True
         self._merge_heart_rates = True
+        self._preserve_invalid_values = False  # New option for roundtrip fidelity
 
 
     def is_fit(self):
@@ -120,6 +121,7 @@ class Decoder:
                 expand_sub_fields = True,
                 expand_components = True,
                 merge_heart_rates = True,
+                preserve_invalid_values = False,
                 mesg_listener = None,
                 decode_mode = DecodeMode.NORMAL):
         '''Reads the entire contents of the fit file and returns the decoded messages'''
@@ -130,6 +132,7 @@ class Decoder:
         self._expand_sub_fields = expand_sub_fields
         self._expand_components = expand_components
         self._merge_heart_rates = merge_heart_rates
+        self._preserve_invalid_values = preserve_invalid_values
         self._mesg_listener = mesg_listener
         self._decode_mode = decode_mode
 
@@ -348,9 +351,9 @@ class Decoder:
             field_name = field_profile['name'] if field_id in mesg_def['fields'] else field_id
 
             if field_profile is not None and 'has_components' in field_profile:
-                convert_invalids_to_none = not field_profile['has_components']
+                convert_invalids_to_none = not field_profile['has_components'] and not self._preserve_invalid_values
             else:
-                convert_invalids_to_none = True
+                convert_invalids_to_none = not self._preserve_invalid_values
 
             field_value = None
 

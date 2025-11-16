@@ -42,7 +42,7 @@ class TestRoundTrip:
         
         # Decode original messages
         original_stream.reset()
-        original_messages, original_errors = original_decoder.read()
+        original_messages, original_errors = original_decoder.read(preserve_invalid_values=True)
         
         assert len(original_errors) == 0, f"Original decoding errors: {original_errors}"
         assert len(original_messages) > 0, "Original messages should not be empty"
@@ -69,7 +69,7 @@ class TestRoundTrip:
         
         # Decode new messages
         new_stream.reset()
-        new_messages, new_errors = new_decoder.read()
+        new_messages, new_errors = new_decoder.read(preserve_invalid_values=True)
 
         # Handle known decoder issues with specific files
         if "HrmPluginTestActivity.fit" in fit_file and len(new_errors) > 0:
@@ -87,14 +87,14 @@ class TestRoundTrip:
         # Ignore problematic fields that have known encoding issues
         ignore_fields = [
             # Power phase arrays - FIXED! Scaling formula corrected
-            # 'left_power_phase', 
-            # 'right_power_phase', 
+            # 'left_power_phase',
+            # 'right_power_phase',
             # 'left_power_phase_peak',
             # 'right_power_phase_peak',
             'altitude',  # Invalid value handling issue (-127 preservation)
             'enhanced_altitude',  # Related to altitude invalid values
             'left_right_balance',  # Field encoding issues
-            'event_group',  # Event field encoding issues
+            # 'event_group',  # Event field encoding issues - TBD
             'manufacturer',  # File ID field issues
             'developer_fields',  # Developer field encoding not implemented
         ]
