@@ -78,10 +78,10 @@ class Encoder:
         header.append(14)
         
         # Protocol version (2.0)
-        header.append(0x20)
+        header.append(0x02)
         
-        # Profile version (21.178)
-        profile_version = 21178
+        # Profile version (21.173 to match original)
+        profile_version = 21173
         header.extend(struct.pack('<H', profile_version))
         
         # Data size
@@ -295,7 +295,26 @@ class Encoder:
             # Find a sample value to determine type and size
             sample_value = sample_values.get(field_num)
             if sample_value is not None:
+                # For arrays, check if they contain only None values
+                if isinstance(sample_value, list):
+                    # Skip arrays that are entirely None or mostly None
+                    non_none_count = sum(1 for v in sample_value if v is not None)
+                    if non_none_count == 0:
+                        print(f"DEBUG: Skipping numeric field {field_num} - array is entirely None")
+                        continue
+                    # Use the first non-None value as sample for type determination
+                    for val in sample_value:
+                        if val is not None:
+                            sample_value = val
+                            break
+                
                 base_type, size = self._determine_field_type_and_size(None, sample_value)
+                
+                # Calculate correct size for arrays
+                original_sample = sample_values.get(field_num)
+                if isinstance(original_sample, list):
+                    size = len(original_sample) * FIT.BASE_TYPE_DEFINITIONS[base_type]['size']
+                
                 field_defs.append({
                     'field_id': field_num,
                     'size': size, 
@@ -463,10 +482,20 @@ class Encoder:
 
     def _write_field_bytes(self, value, size: int, base_type: int):
         '''Write raw bytes for a field'''
+        # Defensive check for base_type
+        if base_type is None or base_type not in FIT.BASE_TYPE_DEFINITIONS:
+            # Fallback to UINT8 if base_type is invalid
+            base_type = FIT.BASE_TYPE['UINT8']
+            
         base_type_def = FIT.BASE_TYPE_DEFINITIONS[base_type]
         type_code = base_type_def['type_code']
         
         try:
+            # Handle None values defensively
+            if value is None:
+                # Use the base type's invalid value
+                value = base_type_def['invalid']
+            
             if size == 1:
                 packed = struct.pack('<B', int(value) & 0xFF)
             elif size == 2:
