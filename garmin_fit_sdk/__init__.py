@@ -16,6 +16,7 @@ from garmin_fit_sdk.accumulator import Accumulator
 from garmin_fit_sdk.bitstream import BitStream
 from garmin_fit_sdk.crc_calculator import CrcCalculator
 from garmin_fit_sdk.decoder import Decoder
+from garmin_fit_sdk.encoder import Encoder
 from garmin_fit_sdk.fit import BASE_TYPE, BASE_TYPE_DEFINITIONS
 from garmin_fit_sdk.hr_mesg_utils import expand_heart_rates
 from garmin_fit_sdk.profile import Profile
