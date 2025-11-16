@@ -353,8 +353,12 @@ class Encoder:
             else:
                 # Write actual field value
                 field_value = message[field_name]
-                # Look up field profile by field ID, not field name
-                field_profile = msg_profile['fields'].get(field_id, {})
+                # Look up field profile by searching for the field with matching name
+                field_profile = {}
+                for fid, finfo in msg_profile['fields'].items():
+                    if finfo.get('name') == field_name:
+                        field_profile = finfo
+                        break
                 self._write_field_value(field_value, field_def['size'], field_def['base_type'], field_profile)
 
     def _write_field_value(self, value, size: int, base_type: int, field_profile: dict):
@@ -435,10 +439,14 @@ class Encoder:
                 self._write_field_bytes(base_type_def['invalid'], base_type_def['size'], base_type)
                 return
                 
-            if type_code in ['b', 'B']:
-                packed = struct.pack('<' + type_code, int(value) & 0xFF)
-            elif type_code in ['h', 'H']:
-                packed = struct.pack('<' + type_code, int(value) & 0xFFFF)
+            if type_code == 'b':  # signed byte
+                packed = struct.pack('<b', int(value))
+            elif type_code == 'B':  # unsigned byte
+                packed = struct.pack('<B', int(value) & 0xFF)
+            elif type_code == 'h':  # signed short
+                packed = struct.pack('<h', int(value))
+            elif type_code == 'H':  # unsigned short
+                packed = struct.pack('<H', int(value) & 0xFFFF)
             elif type_code in ['i', 'I', 'l', 'L']:
                 packed = struct.pack('<' + type_code, int(value) & 0xFFFFFFFF)
             elif type_code in ['q', 'Q']:
