@@ -433,9 +433,13 @@ class Encoder:
                 if scale != 1 or offset != 0:
                     # Only apply scaling to numeric values, not None
                     if value is not None:
-                        # Reverse the decoder's operation: raw = (actual + offset) * scale
-                        # Decoder does: actual = (raw / scale) - offset
-                        value = int((value + offset) * scale)
+                        # The correct formula depends on whether there's an offset
+                        if offset == 0:
+                            # For zero offset: decoder = raw / scale, so encoder = actual * scale
+                            value = round(value * scale)
+                        else:
+                            # For non-zero offset: decoder = (raw / scale) + offset, so encoder = (actual - offset) * scale
+                            value = round((value - offset) * scale)
         
         # Convert strings back to numbers if needed
         if isinstance(value, str) and base_type != FIT.BASE_TYPE['STRING']:
