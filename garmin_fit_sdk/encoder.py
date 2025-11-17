@@ -182,7 +182,11 @@ class Encoder:
         # Pre-analyze ALL values for each developer field to determine the widest required type
         dev_field_values = {}  # dev_id -> list of all values
         
+        # Also collect all values for regular fields to ensure consistent typing
+        regular_field_values = {}  # field_name/number -> list of all values
+        
         for message in messages:
+            # Collect developer field values
             if 'developer_fields' in message and isinstance(message['developer_fields'], dict):
                 for dev_id, dev_value in message['developer_fields'].items():
                     if dev_id not in dev_field_values:
@@ -191,6 +195,13 @@ class Encoder:
                     if dev_value is not None:
                         # Always append the value as-is, whether it's a list or single value
                         dev_field_values[dev_id].append(dev_value)
+            
+            # Collect regular field values for unified type determination
+            for field_name, field_value in message.items():
+                if field_name not in ['mesg_num', 'developer_fields'] and field_value is not None:
+                    if field_name not in regular_field_values:
+                        regular_field_values[field_name] = []
+                    regular_field_values[field_name].append(field_value)
         
         # Determine the optimal type for each developer field based on ALL its values
         dev_field_patterns = {}
@@ -309,10 +320,17 @@ class Encoder:
                 
                 definition_cache[field_signature] = local_msg_num
                 
-                # Create a sample message with proper types for the developer fields
+                # Create a sample message with proper types for all fields
                 sample_message = dict(message)
+                
+                # Override regular field values with unified values for consistent typing
+                for field_name, all_values in regular_field_values.items():
+                    if field_name in sample_message:
+                        # Use all values for type determination instead of just this message's value
+                        sample_message[field_name] = all_values
+                
                 if 'developer_fields' in sample_message:
-                    # Ensure the sample has the right type pattern
+                    # Ensure the sample has the right type pattern for developer fields
                     sample_dev_fields = {}
                     for dev_id, dev_value in sample_message['developer_fields'].items():
                         expected_type = dev_field_patterns.get(dev_id, 7)
@@ -406,7 +424,8 @@ class Encoder:
             for field_name, field_value in message.items():
                 if field_name != 'mesg_num' and field_value is not None:
                     if field_name not in sample_message:
-                        sample_message[field_name] = field_value
+                        sample_message[field_name] = []
+                    sample_message[field_name].append(field_value)
         
         # Instead of complex component detection, use a simpler approach:
         # Only include fields that have meaningful (non-default) values consistently
@@ -713,8 +732,15 @@ class Encoder:
                     field_name_to_id[field_name] = field_id
                     
                     # Determine base type and size using existing method
-                    sample_value = sample_values.get(field_name)
-                    if sample_value is not None:
+                    sample_values_list = sample_values.get(field_name)
+                    if sample_values_list is not None:
+                        # Ensure we have a list
+                        if not isinstance(sample_values_list, list):
+                            sample_values_list = [sample_values_list]
+                        
+                        # Use the first value as representative for profile-based fields
+                        # Profile fields should have consistent types
+                        sample_value = sample_values_list[0]
                         base_type, size = self._determine_field_type_and_size(field_profile, sample_value)
                     else:
                         # Fallback to reasonable defaults based on field type
@@ -736,27 +762,91 @@ class Encoder:
         # Process numeric fields (developer fields)
         for field_num in sorted(numeric_fields):
             # Find a sample value to determine type and size
-            sample_value = sample_values.get(field_num)
-            if sample_value is not None:
+            sample_values_list = sample_values.get(field_num)
+            if sample_values_list is not None:
+                # Ensure we have a list
+                if not isinstance(sample_values_list, list):
+                    sample_values_list = [sample_values_list]
+                
                 # For arrays, check if they contain only None values
-                if isinstance(sample_value, list):
-                    # Skip arrays that are entirely None or mostly None
-                    non_none_count = sum(1 for v in sample_value if v is not None)
-                    if non_none_count == 0:
-                        print(f"DEBUG: Skipping numeric field {field_num} - array is entirely None")
+                first_value = sample_values_list[0]
+                if isinstance(first_value, list):
+                    # This field contains arrays - need to flatten all values
+                    all_array_values = []
+                    for array_val in sample_values_list:
+                        if isinstance(array_val, list):
+                            all_array_values.extend([v for v in array_val if v is not None])
+                    
+                    if not all_array_values:
                         continue
-                    # Use the first non-None value as sample for type determination
-                    for val in sample_value:
-                        if val is not None:
-                            sample_value = val
-                            break
-                
-                base_type, size = self._determine_field_type_and_size(None, sample_value)
-                
-                # Calculate correct size for arrays
-                original_sample = sample_values.get(field_num)
-                if isinstance(original_sample, list):
-                    size = len(original_sample) * FIT.BASE_TYPE_DEFINITIONS[base_type]['size']
+                    
+                    # Use the first array as template for structure, but determine type from all values
+                    template_array = first_value
+                    
+                    # Determine type that can handle all values in all arrays
+                    if all_array_values:
+                        if all(isinstance(v, int) for v in all_array_values):
+                            # Integer array - choose based on full range
+                            min_val = min(all_array_values)
+                            max_val = max(all_array_values)
+                            
+                            if 0 <= min_val and max_val <= 255:
+                                elem_type = FIT.BASE_TYPE['UINT8']
+                            elif -128 <= min_val and max_val <= 127:
+                                elem_type = FIT.BASE_TYPE['SINT8']
+                            elif 0 <= min_val and max_val <= 65535:
+                                elem_type = FIT.BASE_TYPE['UINT16']
+                            elif -32768 <= min_val and max_val <= 32767:
+                                elem_type = FIT.BASE_TYPE['SINT16']
+                            elif 0 <= min_val and max_val <= 4294967295:
+                                elem_type = FIT.BASE_TYPE['UINT32']
+                            else:
+                                elem_type = FIT.BASE_TYPE['SINT32']
+                        else:
+                            # Mixed or float array
+                            elem_type = FIT.BASE_TYPE['FLOAT32']
+                        
+                        base_type = elem_type
+                        size = len(template_array) * FIT.BASE_TYPE_DEFINITIONS[elem_type]['size']
+                    else:
+                        base_type = FIT.BASE_TYPE['UINT8']
+                        size = len(template_array)
+                else:
+                    # Single values - determine type that can handle all of them
+                    if all(isinstance(v, int) for v in sample_values_list):
+                        min_val = min(sample_values_list)
+                        max_val = max(sample_values_list)
+                        
+                        if -128 <= min_val and max_val <= 127:
+                            base_type = FIT.BASE_TYPE['SINT8']
+                            size = 1
+                        elif 0 <= min_val and max_val <= 255:
+                            base_type = FIT.BASE_TYPE['UINT8']
+                            size = 1
+                        elif -32768 <= min_val and max_val <= 32767:
+                            base_type = FIT.BASE_TYPE['SINT16']
+                            size = 2
+                        elif 0 <= min_val and max_val <= 65535:
+                            base_type = FIT.BASE_TYPE['UINT16']
+                            size = 2
+                        elif -2147483648 <= min_val and max_val <= 2147483647:
+                            base_type = FIT.BASE_TYPE['SINT32']
+                            size = 4
+                        else:
+                            base_type = FIT.BASE_TYPE['UINT32']
+                            size = 4
+                    elif all(isinstance(v, float) for v in sample_values_list):
+                        base_type = FIT.BASE_TYPE['FLOAT32']
+                        size = 4
+                    elif all(isinstance(v, str) for v in sample_values_list):
+                        # String field - use longest string length
+                        max_len = max(len(s.encode('utf-8')) for s in sample_values_list)
+                        base_type = FIT.BASE_TYPE['STRING']
+                        size = max_len + 1  # +1 for null terminator
+                    else:
+                        # Mixed types - default to UINT32
+                        base_type = FIT.BASE_TYPE['UINT32']
+                        size = 4
                 
                 field_defs.append({
                     'field_id': field_num,
@@ -991,6 +1081,9 @@ class Encoder:
     def _determine_field_type_and_size(self, field_profile: dict, field_value) -> tuple:
         '''Determine the base type and size for a field'''
         
+        if field_value == 317:  # Debug specific case
+            print(f"DEBUG: _determine_field_type_and_size called with value 317, profile: {field_profile}")
+        
         # Handle developer fields (when field_profile is None)
         if field_profile is None:
             # For developer fields, infer type from the value
@@ -1069,6 +1162,8 @@ class Encoder:
                 elif -32768 <= field_value <= 32767:
                     return FIT.BASE_TYPE['SINT16'], 2
                 elif 0 <= field_value <= 65535:
+                    if field_value == 317:  # Debug specific case
+                        print(f"DEBUG: Value 317 assigned UINT16")
                     return FIT.BASE_TYPE['UINT16'], 2
                 elif -2147483648 <= field_value <= 2147483647:
                     return FIT.BASE_TYPE['SINT32'], 4
@@ -1076,7 +1171,41 @@ class Encoder:
                     return FIT.BASE_TYPE['UINT32'], 4
             elif isinstance(field_value, (list, tuple)):
                 if field_value:
-                    elem_type, elem_size = self._determine_field_type_and_size({}, field_value[0])
+                    # Examine all elements to determine the required type range
+                    all_elements = []
+                    for elem in field_value:
+                        if isinstance(elem, (int, float)):
+                            all_elements.append(elem)
+                    
+                    if all_elements:
+                        min_val = min(all_elements)
+                        max_val = max(all_elements)
+                        
+                        # Choose type that can hold the full range
+                        if all(isinstance(elem, int) for elem in all_elements):
+                            # Integer array - choose based on range
+                            if 0 <= min_val and max_val <= 255:
+                                elem_type = FIT.BASE_TYPE['UINT8']
+                            elif -128 <= min_val and max_val <= 127:
+                                elem_type = FIT.BASE_TYPE['SINT8']
+                            elif 0 <= min_val and max_val <= 65535:
+                                elem_type = FIT.BASE_TYPE['UINT16']
+                            elif -32768 <= min_val and max_val <= 32767:
+                                elem_type = FIT.BASE_TYPE['SINT16']
+                            elif 0 <= min_val and max_val <= 4294967295:
+                                elem_type = FIT.BASE_TYPE['UINT32']
+                            else:
+                                elem_type = FIT.BASE_TYPE['SINT32']
+                        else:
+                            # Mixed or float array
+                            elem_type = FIT.BASE_TYPE['FLOAT32']
+                        
+                        elem_size = FIT.BASE_TYPE_DEFINITIONS[elem_type]['size']
+                    else:
+                        # Empty numeric array - default to UINT8
+                        elem_type = FIT.BASE_TYPE['UINT8']
+                        elem_size = 1
+                    
                     return elem_type, len(field_value) * elem_size
                 else:
                     return FIT.BASE_TYPE['UINT8'], 1
