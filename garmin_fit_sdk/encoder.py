@@ -201,8 +201,51 @@ class Encoder:
                 dev_field_patterns[dev_id] = 2  # Default UINT8
                 continue
             
-            # For integers, find min/max to determine optimal type
-            if all(isinstance(v, int) for v in values):
+            # Check if we have any arrays in the values
+            has_arrays = any(isinstance(v, list) for v in values)
+            
+            if has_arrays:
+                # For arrays, we need to look at the element types, not the array type
+                all_elements = []
+                for value in values:
+                    if isinstance(value, list):
+                        all_elements.extend(v for v in value if v is not None)
+                    elif value is not None:
+                        all_elements.append(value)
+                
+                # Determine type based on array elements
+                if all_elements:
+                    if all(isinstance(v, str) for v in all_elements):
+                        dev_field_patterns[dev_id] = 7  # STRING (for string arrays)
+                    elif all(isinstance(v, int) for v in all_elements):
+                        min_val, max_val = min(all_elements), max(all_elements)
+                        print(f"Developer field {dev_id}: array with element range {min_val} to {max_val}")
+                        
+                        # Choose type based on element range
+                        if min_val >= 0:
+                            if max_val <= 255:
+                                field_type = 2  # UINT8
+                            elif max_val <= 65535:
+                                field_type = 132  # UINT16
+                            else:
+                                field_type = 134  # UINT32
+                        else:
+                            if -128 <= min_val and max_val <= 127:
+                                field_type = 1  # SINT8
+                            elif -32768 <= min_val and max_val <= 32767:
+                                field_type = 131  # SINT16
+                            else:
+                                field_type = 133  # SINT32
+                        dev_field_patterns[dev_id] = field_type
+                        print(f"Assigned array element type {field_type} to developer field {dev_id}")
+                    elif any(isinstance(v, float) for v in all_elements):
+                        dev_field_patterns[dev_id] = 136  # FLOAT32
+                    else:
+                        dev_field_patterns[dev_id] = 7  # STRING fallback
+                else:
+                    dev_field_patterns[dev_id] = 2  # Default UINT8
+            elif all(isinstance(v, int) for v in values):
+                # Non-array integers
                 min_val, max_val = min(values), max(values)
                 print(f"Developer field {dev_id}: values range {min_val} to {max_val}")
                 
@@ -295,6 +338,7 @@ class Encoder:
                 
                 # Write message definition for this specific field combination  
                 print(f"Writing definition for slot {local_msg_num} with dev field types: {[(dev_id, dev_field_patterns.get(dev_id)) for dev_id in sample_message.get('developer_fields', {}).keys()]}")
+                print(f"Sample developer_fields: {sample_message.get('developer_fields', {})}")
                 self._write_specific_message_definition(local_msg_num, global_msg_num, msg_profile, message_fields, sample_message, dev_field_patterns)
             
             # Write the message data using the appropriate definition 
@@ -470,25 +514,56 @@ class Encoder:
                                 expected_type = dev_field_patterns[dev_field_id]
                                 print(f"Using pre-analyzed type {expected_type} for developer field {dev_field_id}")
                                 
-                                if expected_type == 1:  # SINT8
-                                    base_type, size = FIT.BASE_TYPE['SINT8'], 1
-                                elif expected_type == 2:  # UINT8
-                                    base_type, size = FIT.BASE_TYPE['UINT8'], 1
-                                elif expected_type == 131:  # SINT16
-                                    base_type, size = FIT.BASE_TYPE['SINT16'], 2
-                                elif expected_type == 132:  # UINT16
-                                    base_type, size = FIT.BASE_TYPE['UINT16'], 2
-                                elif expected_type == 133:  # SINT32
-                                    base_type, size = FIT.BASE_TYPE['SINT32'], 4
-                                elif expected_type == 134:  # UINT32
-                                    base_type, size = FIT.BASE_TYPE['UINT32'], 4
-                                elif expected_type == 136:  # FLOAT32
-                                    base_type, size = FIT.BASE_TYPE['FLOAT32'], 4
-                                else:  # STRING or other
-                                    if isinstance(dev_value, str):
-                                        base_type, size = FIT.BASE_TYPE['STRING'], len(dev_value.encode('utf-8')) + 1
+                                # Calculate size based on the actual value structure
+                                if isinstance(dev_value, list):
+                                    # Array field - calculate size based on number of elements
+                                    if expected_type == 1:  # SINT8
+                                        base_type, element_size = FIT.BASE_TYPE['SINT8'], 1
+                                    elif expected_type == 2:  # UINT8
+                                        base_type, element_size = FIT.BASE_TYPE['UINT8'], 1
+                                    elif expected_type == 131:  # SINT16
+                                        base_type, element_size = FIT.BASE_TYPE['SINT16'], 2
+                                    elif expected_type == 132:  # UINT16
+                                        base_type, element_size = FIT.BASE_TYPE['UINT16'], 2
+                                    elif expected_type == 133:  # SINT32
+                                        base_type, element_size = FIT.BASE_TYPE['SINT32'], 4
+                                    elif expected_type == 134:  # UINT32
+                                        base_type, element_size = FIT.BASE_TYPE['UINT32'], 4
+                                    elif expected_type == 136:  # FLOAT32
+                                        base_type, element_size = FIT.BASE_TYPE['FLOAT32'], 4
+                                    elif expected_type == 7:  # STRING
+                                        # For string arrays, calculate total string length
+                                        total_length = sum(len(str(s).encode('utf-8')) + 1 for s in dev_value if s is not None)
+                                        base_type, size = FIT.BASE_TYPE['STRING'], max(total_length, 1)
                                     else:
-                                        base_type, size = FIT.BASE_TYPE['UINT8'], 1  # Default fallback
+                                        base_type, element_size = FIT.BASE_TYPE['UINT8'], 1
+                                    
+                                    if expected_type != 7:  # Not string
+                                        size = len(dev_value) * element_size
+                                        print(f"Developer field {dev_field_id}: array size = {len(dev_value)} * {element_size} = {size}")
+                                else:
+                                    # Single value
+                                    if expected_type == 1:  # SINT8
+                                        base_type, size = FIT.BASE_TYPE['SINT8'], 1
+                                    elif expected_type == 2:  # UINT8
+                                        base_type, size = FIT.BASE_TYPE['UINT8'], 1
+                                    elif expected_type == 131:  # SINT16
+                                        base_type, size = FIT.BASE_TYPE['SINT16'], 2
+                                    elif expected_type == 132:  # UINT16
+                                        base_type, size = FIT.BASE_TYPE['UINT16'], 2
+                                    elif expected_type == 133:  # SINT32
+                                        base_type, size = FIT.BASE_TYPE['SINT32'], 4
+                                    elif expected_type == 134:  # UINT32
+                                        base_type, size = FIT.BASE_TYPE['UINT32'], 4
+                                    elif expected_type == 136:  # FLOAT32
+                                        base_type, size = FIT.BASE_TYPE['FLOAT32'], 4
+                                    elif expected_type == 7:  # STRING
+                                        if isinstance(dev_value, str):
+                                            base_type, size = FIT.BASE_TYPE['STRING'], len(dev_value.encode('utf-8')) + 1
+                                        else:
+                                            base_type, size = FIT.BASE_TYPE['STRING'], 1
+                                    else:
+                                        base_type, size = FIT.BASE_TYPE['UINT8'], 1
                             else:
                                 # Fall back to original value-based type determination
                                 if isinstance(dev_value, str):
@@ -644,6 +719,8 @@ class Encoder:
                 developer_fields = message.get('developer_fields', {})
                 if dev_field_id in developer_fields:
                     field_value = developer_fields[dev_field_id]
+                    if dev_field_id == 2:
+                        print(f"  ENCODING Field 2: value={field_value}, type={type(field_value)}, size={field_def['size']}, base_type={field_def['base_type']}")
                     pass  # Developer field processing
                     self._write_field_value(field_value, field_def['size'], field_def['base_type'], {})
                 else:
@@ -679,8 +756,21 @@ class Encoder:
         base_type_def = FIT.BASE_TYPE_DEFINITIONS[base_type]
         
         if base_type == FIT.BASE_TYPE['STRING']:
-            # String field
-            if isinstance(value, str):
+            # String field - handle both single strings and string arrays
+            if isinstance(value, list):
+                # String array - concatenate with null separators
+                concatenated = b''
+                for item in value:
+                    if item is not None:
+                        item_bytes = str(item).encode('utf-8') + b'\x00'
+                        concatenated += item_bytes
+                # Pad or truncate to fit size
+                if len(concatenated) < size:
+                    concatenated += b'\x00' * (size - len(concatenated))
+                else:
+                    concatenated = concatenated[:size-1] + b'\x00'
+                self._data_buffer.extend(concatenated[:size])
+            elif isinstance(value, str):
                 string_bytes = value.encode('utf-8')
                 # Pad or truncate to fit size
                 if len(string_bytes) < size:

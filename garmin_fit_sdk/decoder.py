@@ -702,7 +702,20 @@ class Decoder:
                 # Check if this is a mapped developer field (240+ field IDs)
                 if isinstance(field, int) and field >= 240:
                     original_dev_field_id = field - 240
-                    developer_fields[original_dev_field_id] = message[field]
+                    field_value = message[field]
+                    
+                    # Special handling for string arrays - detect if this is a concatenated string that should be split
+                    if isinstance(field_value, str) and '\x00' in field_value:
+                        # This might be a concatenated string array, split it
+                        string_parts = field_value.split('\x00')
+                        # Remove empty strings from the end (null terminators)
+                        while string_parts and string_parts[-1] == '':
+                            string_parts.pop()
+                        # If we have multiple non-empty parts, treat as array
+                        if len(string_parts) > 1:
+                            field_value = string_parts
+                    
+                    developer_fields[original_dev_field_id] = field_value
                     fields_to_remove.append(field)
             
             # Remove the mapped developer fields and add them to developer_fields
