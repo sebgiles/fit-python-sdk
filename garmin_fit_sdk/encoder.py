@@ -189,10 +189,8 @@ class Encoder:
                         dev_field_values[dev_id] = []
                     
                     if dev_value is not None:
-                        if isinstance(dev_value, list):
-                            dev_field_values[dev_id].extend(v for v in dev_value if v is not None)
-                        else:
-                            dev_field_values[dev_id].append(dev_value)
+                        # Always append the value as-is, whether it's a list or single value
+                        dev_field_values[dev_id].append(dev_value)
         
         # Determine the optimal type for each developer field based on ALL its values
         dev_field_patterns = {}
@@ -224,20 +222,19 @@ class Encoder:
                         # Choose type based on element range
                         if min_val >= 0:
                             if max_val <= 255:
-                                field_type = 2  # UINT8
+                                field_type = 2  # UINT8 (for arrays, this is still type 2)
                             elif max_val <= 65535:
                                 field_type = 132  # UINT16
                             else:
                                 field_type = 134  # UINT32
                         else:
                             if -128 <= min_val and max_val <= 127:
-                                field_type = 1  # SINT8
+                                field_type = 142  # SINT8 array (was 1, now 142)
                             elif -32768 <= min_val and max_val <= 32767:
                                 field_type = 131  # SINT16
                             else:
                                 field_type = 133  # SINT32
                         dev_field_patterns[dev_id] = field_type
-                        print(f"Assigned array element type {field_type} to developer field {dev_id}")
                     elif any(isinstance(v, float) for v in all_elements):
                         dev_field_patterns[dev_id] = 136  # FLOAT32
                     else:
@@ -531,6 +528,8 @@ class Encoder:
                                         base_type, element_size = FIT.BASE_TYPE['UINT32'], 4
                                     elif expected_type == 136:  # FLOAT32
                                         base_type, element_size = FIT.BASE_TYPE['FLOAT32'], 4
+                                    elif expected_type == 142:  # SINT8 array
+                                        base_type, element_size = FIT.BASE_TYPE['SINT8'], 1
                                     elif expected_type == 7:  # STRING
                                         # For string arrays, calculate total string length
                                         total_length = sum(len(str(s).encode('utf-8')) + 1 for s in dev_value if s is not None)
@@ -713,7 +712,7 @@ class Encoder:
                     break
             
             # Check if this is a developer field
-            if field_name and field_name.startswith('developer_field_'):
+            if field_name and isinstance(field_name, str) and field_name.startswith('developer_field_'):
                 # Extract developer field ID and get value from developer_fields dict
                 dev_field_id = int(field_name.split('_')[-1])
                 developer_fields = message.get('developer_fields', {})
