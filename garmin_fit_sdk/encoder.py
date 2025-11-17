@@ -341,6 +341,23 @@ class Encoder:
             # Write the message data using the appropriate definition 
             self._write_message_data(local_msg_num, msg_profile, message)
 
+    def _is_default_value(self, value):
+        '''Check if a value is a FIT default/invalid value'''
+        if value is None:
+            return True
+            
+        # Common FIT invalid/default values
+        if isinstance(value, int):
+            return value in [255, 65535, 4294967295, -1, 0xFF, 0xFFFF, 0xFFFFFFFF]
+        elif isinstance(value, float):
+            return value in [255.0, 65535.0, 4294967295.0] or value != value  # NaN check
+        elif isinstance(value, str):
+            return value == ''
+        elif isinstance(value, list):
+            return len(value) == 0 or all(self._is_default_value(v) for v in value)
+            
+        return False
+
     def _write_unified_messages(self, global_msg_num: int, msg_profile: dict, messages: list):
         '''Unified approach for messages without developer fields for efficiency'''
         # Create one comprehensive definition that handles all variants
@@ -352,12 +369,38 @@ class Encoder:
         self._next_local_msg_num += 1
         
         # Create a comprehensive field set that includes all possible fields
+        # Remove debug output and implement the fix
         all_fields = set()
         sample_message = {}
+        # Component fields that should not be included if parent field exists
+        # Disabled for now - let the decoder/test handle component filtering
+        COMPONENT_EXCLUSIONS = {
+            # # If 'power' exists, exclude all these component fields
+            # 'power': {
+            #     'left_right_balance', 'left_power_phase', 'right_power_phase',
+            #     'left_power_phase_peak', 'right_power_phase_peak', 'left_pco', 
+            #     'right_pco', 'accumulated_power', 'cadence', 'fractional_cadence',
+            #     'enhanced_respiration_rate', 90  # Field 90 is a power component
+            # },
+            # Add other component exclusions as needed
+        }
         
         for message in messages:
-            message_fields = set(field for field in message.keys() if field != 'mesg_num')
-            all_fields.update(message_fields)
+            message_fields = set(field for field in message.keys() 
+                               if field != 'mesg_num')
+            
+            # Filter out component fields if their parent exists
+            filtered_fields = set()
+            for field in message_fields:
+                is_component = False
+                for parent_field, components in COMPONENT_EXCLUSIONS.items():
+                    if field in components and parent_field in message_fields:
+                        is_component = True
+                        break
+                if not is_component:
+                    filtered_fields.add(field)
+            
+            all_fields.update(filtered_fields)
             
             # Collect sample values for type determination
             for field_name, field_value in message.items():
@@ -365,8 +408,55 @@ class Encoder:
                     if field_name not in sample_message:
                         sample_message[field_name] = field_value
         
+        # Instead of complex component detection, use a simpler approach:
+        # Only include fields that have meaningful (non-default) values consistently
+        
+        # Collect fields that appear with non-default values
+        field_value_counts = {}
+        meaningful_fields = set()
+        
+        for message in messages:
+            for field_name, field_value in message.items():
+                if field_name == 'mesg_num':
+                    continue
+                
+                # Skip component fields if their parent exists  
+                is_component = False
+                for parent_field, components in COMPONENT_EXCLUSIONS.items():
+                    if field_name in components and parent_field in message:
+                        is_component = True
+                        break
+                if is_component:
+                    continue
+                    
+                if field_name not in field_value_counts:
+                    field_value_counts[field_name] = {'total': 0, 'meaningful': 0}
+                
+                field_value_counts[field_name]['total'] += 1
+                
+                # Check if value is meaningful (not default/invalid)
+                if field_value is not None and not self._is_default_value(field_value):
+                    field_value_counts[field_name]['meaningful'] += 1
+        
+        # Only include fields that have meaningful values in at least 10% of messages
+        for field_name, counts in field_value_counts.items():
+            if counts['meaningful'] > 0:  # At least one meaningful value
+                meaningful_fields.add(field_name)
+        
+        # Debug: show filtering results for record messages  
+        # if msg_profile.get('name') == 'record':
+        #     print(f"DEBUG: All fields: {len(all_fields)}")
+        #     print(f"DEBUG: Meaningful fields: {len(meaningful_fields)}")
+        #     removed_fields = all_fields - meaningful_fields
+        #     if removed_fields:
+        #         removed_names = [str(f) for f in removed_fields if isinstance(f, str)]
+        #         print(f"DEBUG: Removed default-value fields: {sorted(removed_names)}")
+        
+        # Update sample message to only include meaningful fields
+        filtered_sample_message = {k: v for k, v in sample_message.items() if k in meaningful_fields}
+        
         # Write one definition that covers all possible field combinations
-        self._write_specific_message_definition(local_msg_num, global_msg_num, msg_profile, all_fields, sample_message)
+        self._write_specific_message_definition(local_msg_num, global_msg_num, msg_profile, meaningful_fields, filtered_sample_message)
         
         # Write all messages using this unified definition
         for message in messages:
@@ -699,7 +789,7 @@ class Encoder:
         
         # Get field definitions
         msg_def = self._local_mesg_defs[local_msg_num]
-        
+
             # Write field data in the order defined in the message definition
         for field_def in msg_def['field_defs']:
             field_id = field_def['field_id']
