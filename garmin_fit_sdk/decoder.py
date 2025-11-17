@@ -699,38 +699,22 @@ class Decoder:
                     message[field] = message[field]['field_value'] if 'field_value' in message[field] else message[field]['raw_field_value']
                 message[field] = util._sanitize_values(message[field])
                 
-                # Check if this field has a numeric field name (unknown field)
-                if isinstance(field, int):
-                    field_id = int(field)
-                    field_value = message[field]
-                    
-                    # Skip invalid values - these are placeholders, not real data
-                    if field_value is not None and not self._is_invalid_value(field_value):
-                        developer_fields[field_id] = field_value
-                    
+                # Check if this is a mapped developer field (240+ field IDs)
+                if isinstance(field, int) and field >= 240:
+                    original_dev_field_id = field - 240
+                    developer_fields[original_dev_field_id] = message[field]
                     fields_to_remove.append(field)
             
-            # Remove the numeric fields from the main message and add them as developer_fields
+            # Remove the mapped developer fields and add them to developer_fields
             for field in fields_to_remove:
                 del message[field]
                 
             if developer_fields:
-                # Merge with any existing developer_fields from actual developer data
+                # Merge with any existing developer_fields
                 if 'developer_fields' in message:
                     message['developer_fields'].update(developer_fields)
                 else:
                     message['developer_fields'] = developer_fields
-
-    def _is_invalid_value(self, value):
-        """Check if a value appears to be an invalid/placeholder value"""
-        # Common invalid values used in FIT format
-        if isinstance(value, int):
-            return value in [0xFF, 0xFFFF, 0xFFFFFFFF, 0x7F, 0x7FFF, 0x7FFFFFFF, 255, 32767, 2147483647]
-        elif isinstance(value, float):
-            return value == float('nan') or abs(value) > 1e10
-        elif isinstance(value, list):
-            return all(self._is_invalid_value(v) for v in value)
-        return False
 
     def __read_raw_values(self, message_size, struct_format_string):
         return self._stream.read_and_unpack(message_size, struct_format_string)

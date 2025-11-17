@@ -29,6 +29,8 @@ class Encoder:
         self._data_buffer = bytearray()
         self._local_mesg_defs = {}  # local_msg_num -> definition info
         self._next_local_msg_num = 0  # Track next available local message number
+        self._dev_field_slots = {}  # (msg_type, dev_field_id) -> (local_msg_num, field_type)
+        self._dev_field_slots = {}  # Reserve slots for developer field patterns to avoid conflicts
 
     def write_to_file(self, filename: str) -> bool:
         '''
@@ -117,7 +119,7 @@ class Encoder:
                     self._write_message_type(global_msg_num, messages)
 
     def _write_message_type(self, message_type_num: int, messages: list):
-        '''Write all messages of a specific type, creating individual definitions for each unique field set'''
+        '''Write all messages of a specific type with smart field combination grouping'''
         # Check if this is a known message type with profile info
         if message_type_num in Profile['messages']:
             msg_profile = Profile['messages'][message_type_num]
@@ -127,36 +129,206 @@ class Encoder:
         
         global_msg_num = message_type_num
         
+        # Special handling for field description messages - they must preserve exact field patterns
+        # since some have native_field_num and others don't
+        if message_type_num == 206:  # field_description_mesg
+            self._write_field_description_messages(global_msg_num, msg_profile, messages)
+            return
+        
+        # Check if any messages have developer fields
+        has_dev_fields = any('developer_fields' in message and isinstance(message['developer_fields'], dict) 
+                           for message in messages)
+        
+        if has_dev_fields:
+            # For messages with developer fields, use individual message definitions to avoid type conflicts
+            self._write_developer_field_messages(global_msg_num, msg_profile, messages)
+        else:
+            # For messages without developer fields, use unified approach for efficiency
+            self._write_unified_messages(global_msg_num, msg_profile, messages)
+
+    def _write_field_description_messages(self, global_msg_num: int, msg_profile: dict, messages: list):
+        '''Special handling for field description messages to preserve exact field patterns'''
         # Track which messages we've processed with each definition
-        definition_cache = {}  # field_set_hash -> local_msg_num
+        definition_cache = {}  # field_signature -> local_msg_num
         
         for message in messages:
             # Skip 'mesg_num' as it's metadata
             message_fields = set(field for field in message.keys() if field != 'mesg_num')
             
-            # Create a hash of the field set to identify identical field combinations
-            field_set_hash = hash(frozenset(message_fields))
+            # Create field signature based on exact fields present
+            field_signature = frozenset(message_fields)
             
-            if field_set_hash in definition_cache:
+            if field_signature in definition_cache:
                 # Reuse existing definition
-                local_msg_num = definition_cache[field_set_hash]
+                local_msg_num = definition_cache[field_signature]
             else:
-                # Get next available local message number
+                # Need a new definition
+                local_msg_num = self._next_local_msg_num
                 if self._next_local_msg_num >= 16:
-                    # FIT protocol limitation: only 16 local message definitions allowed
-                    # We'll have to reuse slots, which may cause some data loss
                     print(f"WARNING: Exceeded 16 local message definitions, reusing slot {self._next_local_msg_num % 16}")
                     local_msg_num = self._next_local_msg_num % 16
-                else:
-                    local_msg_num = self._next_local_msg_num
                 
                 self._next_local_msg_num += 1
-                definition_cache[field_set_hash] = local_msg_num
+                definition_cache[field_signature] = local_msg_num
                 
                 # Write message definition for this specific field combination
                 self._write_specific_message_definition(local_msg_num, global_msg_num, msg_profile, message_fields, message)
             
             # Write the message data using the appropriate definition
+            self._write_message_data(local_msg_num, msg_profile, message)
+
+    def _write_developer_field_messages(self, global_msg_num: int, msg_profile: dict, messages: list):
+        '''Special handling for messages with developer fields to avoid type conflicts'''
+        # Pre-analyze ALL values for each developer field to determine the widest required type
+        dev_field_values = {}  # dev_id -> list of all values
+        
+        for message in messages:
+            if 'developer_fields' in message and isinstance(message['developer_fields'], dict):
+                for dev_id, dev_value in message['developer_fields'].items():
+                    if dev_id not in dev_field_values:
+                        dev_field_values[dev_id] = []
+                    
+                    if dev_value is not None:
+                        if isinstance(dev_value, list):
+                            dev_field_values[dev_id].extend(v for v in dev_value if v is not None)
+                        else:
+                            dev_field_values[dev_id].append(dev_value)
+        
+        # Determine the optimal type for each developer field based on ALL its values
+        dev_field_patterns = {}
+        for dev_id, values in dev_field_values.items():
+            if not values:
+                dev_field_patterns[dev_id] = 2  # Default UINT8
+                continue
+            
+            # For integers, find min/max to determine optimal type
+            if all(isinstance(v, int) for v in values):
+                min_val, max_val = min(values), max(values)
+                print(f"Developer field {dev_id}: values range {min_val} to {max_val}")
+                
+                # Choose the narrowest type that fits all values
+                if min_val >= 0:
+                    # All positive - use unsigned types
+                    if max_val <= 255:
+                        field_type = 2  # UINT8
+                    elif max_val <= 65535:
+                        field_type = 132  # UINT16
+                    else:
+                        field_type = 134  # UINT32
+                else:
+                    # Has negative values - use signed types
+                    if -128 <= min_val and max_val <= 127:
+                        field_type = 1  # SINT8
+                    elif -32768 <= min_val and max_val <= 32767:
+                        field_type = 131  # SINT16
+                    else:
+                        field_type = 133  # SINT32
+                        
+                dev_field_patterns[dev_id] = field_type
+                print(f"Assigned type {field_type} to developer field {dev_id}")
+            else:
+                # Non-integer values
+                if all(isinstance(v, str) for v in values):
+                    dev_field_patterns[dev_id] = 7  # STRING
+                elif any(isinstance(v, float) for v in values):
+                    dev_field_patterns[dev_id] = 136  # FLOAT32
+                else:
+                    dev_field_patterns[dev_id] = 7  # Default to STRING
+        
+        # Use individual message definitions to preserve exact developer field types
+        definition_cache = {}  # field_signature -> local_msg_num
+        
+        for message in messages:
+            # Skip 'mesg_num' as it's metadata
+            message_fields = set(field for field in message.keys() if field != 'mesg_num')
+            
+            # Create field signature that includes developer field IDs and their expected types
+            field_signature = frozenset(message_fields)
+            if 'developer_fields' in message and isinstance(message['developer_fields'], dict):
+                dev_field_types = tuple((dev_id, dev_field_patterns.get(dev_id, 7)) 
+                                      for dev_id in sorted(message['developer_fields'].keys()))
+                field_signature = (field_signature, ('dev_types', dev_field_types))
+            
+            if field_signature in definition_cache:
+                # Reuse existing definition
+                local_msg_num = definition_cache[field_signature]
+            else:
+                # Need a new definition - reserve a slot for this specific pattern
+                local_msg_num = self._next_local_msg_num
+                if self._next_local_msg_num >= 16:
+                    # Try to find a non-conflicting slot
+                    for test_slot in range(16):
+                        if test_slot not in definition_cache.values():
+                            local_msg_num = test_slot
+                            break
+                    else:
+                        print(f"WARNING: All slots occupied, reusing slot {self._next_local_msg_num % 16}")
+                        local_msg_num = self._next_local_msg_num % 16
+                else:
+                    self._next_local_msg_num += 1
+                
+                definition_cache[field_signature] = local_msg_num
+                
+                # Create a sample message with proper types for the developer fields
+                sample_message = dict(message)
+                if 'developer_fields' in sample_message:
+                    # Ensure the sample has the right type pattern
+                    sample_dev_fields = {}
+                    for dev_id, dev_value in sample_message['developer_fields'].items():
+                        expected_type = dev_field_patterns.get(dev_id, 7)
+                        # Use a representative value that fits the expected type
+                        if expected_type == 1:  # SINT8
+                            if isinstance(dev_value, list):
+                                # For lists, use a representative value
+                                sample_dev_fields[dev_id] = 50  # Safe SINT8 value
+                            else:
+                                sample_dev_fields[dev_id] = max(-128, min(127, dev_value))
+                        elif expected_type == 2:  # UINT8
+                            if isinstance(dev_value, list):
+                                # For lists, use a representative value 
+                                sample_dev_fields[dev_id] = 200  # Safe UINT8 value
+                            else:
+                                sample_dev_fields[dev_id] = max(0, min(255, dev_value))
+                        else:
+                            sample_dev_fields[dev_id] = dev_value
+                    sample_message['developer_fields'] = sample_dev_fields
+                
+                # Write message definition for this specific field combination  
+                print(f"Writing definition for slot {local_msg_num} with dev field types: {[(dev_id, dev_field_patterns.get(dev_id)) for dev_id in sample_message.get('developer_fields', {}).keys()]}")
+                self._write_specific_message_definition(local_msg_num, global_msg_num, msg_profile, message_fields, sample_message, dev_field_patterns)
+            
+            # Write the message data using the appropriate definition 
+            self._write_message_data(local_msg_num, msg_profile, message)
+
+    def _write_unified_messages(self, global_msg_num: int, msg_profile: dict, messages: list):
+        '''Unified approach for messages without developer fields for efficiency'''
+        # Create one comprehensive definition that handles all variants
+        local_msg_num = self._next_local_msg_num
+        if self._next_local_msg_num >= 16:
+            print(f"WARNING: Reusing slot {self._next_local_msg_num % 16} for message type {global_msg_num}")
+            local_msg_num = self._next_local_msg_num % 16
+        
+        self._next_local_msg_num += 1
+        
+        # Create a comprehensive field set that includes all possible fields
+        all_fields = set()
+        sample_message = {}
+        
+        for message in messages:
+            message_fields = set(field for field in message.keys() if field != 'mesg_num')
+            all_fields.update(message_fields)
+            
+            # Collect sample values for type determination
+            for field_name, field_value in message.items():
+                if field_name != 'mesg_num' and field_value is not None:
+                    if field_name not in sample_message:
+                        sample_message[field_name] = field_value
+        
+        # Write one definition that covers all possible field combinations
+        self._write_specific_message_definition(local_msg_num, global_msg_num, msg_profile, all_fields, sample_message)
+        
+        # Write all messages using this unified definition
+        for message in messages:
             self._write_message_data(local_msg_num, msg_profile, message)
 
     def _get_message_field_pattern(self, message: dict) -> frozenset:
@@ -248,7 +420,7 @@ class Encoder:
             'field_name_to_id': field_name_to_id
         }
 
-    def _write_specific_message_definition(self, local_msg_num: int, global_msg_num: int, msg_profile, message_fields: set, sample_message: dict):
+    def _write_specific_message_definition(self, local_msg_num: int, global_msg_num: int, msg_profile, message_fields: set, sample_message: dict, dev_field_patterns: dict = None):
         '''Write a message definition for a specific set of fields'''
         # Definition header: 0100xxxx where xxxx is local message number
         definition_header = 0x40 | (local_msg_num & 0x0F)
@@ -283,57 +455,76 @@ class Encoder:
                 if isinstance(dev_fields_dict, dict):
                     for dev_field_id, dev_value in dev_fields_dict.items():
                         if dev_value is not None:
-                            # Use the developer field ID directly if it doesn't conflict
-                            # with profile field IDs. Profile field IDs for this message type
-                            # are already collected in field_name_to_id, so check for conflicts.
-                            mapped_field_id = dev_field_id
+                            # Always remap developer field IDs to avoid conflicts with profile field IDs
+                            # Use a high range starting from 240 to ensure no conflicts
+                            mapped_field_id = 240 + dev_field_id
                             
-                            # If there's a conflict, find a free field ID
-                            used_ids = set(field_name_to_id.values())
-                            used_ids.update([fd['field_id'] for fd in field_defs])
-                            
-                            while mapped_field_id in used_ids and mapped_field_id < 255:
-                                mapped_field_id += 1
-                            
+                            # Ensure we stay within byte range
                             if mapped_field_id > 255:
-                                print(f"WARNING: Cannot find free field ID for developer field {dev_field_id}")
+                                print(f"WARNING: Cannot map developer field {dev_field_id} - would exceed field ID 255")
                                 continue
                                 
-                            # Determine type and size from the value
-                            if isinstance(dev_value, str):
-                                base_type, size = FIT.BASE_TYPE['STRING'], len(dev_value.encode('utf-8')) + 1
-                            elif isinstance(dev_value, bool):
-                                base_type, size = FIT.BASE_TYPE['ENUM'], 1
-                            elif isinstance(dev_value, int):
-                                if -128 <= dev_value <= 127:
+                            # Determine type and size - use pre-analyzed patterns if available
+                            if dev_field_patterns and dev_field_id in dev_field_patterns:
+                                # Use the pre-analyzed type for consistency
+                                expected_type = dev_field_patterns[dev_field_id]
+                                print(f"Using pre-analyzed type {expected_type} for developer field {dev_field_id}")
+                                
+                                if expected_type == 1:  # SINT8
                                     base_type, size = FIT.BASE_TYPE['SINT8'], 1
-                                elif 0 <= dev_value <= 255:
+                                elif expected_type == 2:  # UINT8
                                     base_type, size = FIT.BASE_TYPE['UINT8'], 1
-                                elif -32768 <= dev_value <= 32767:
+                                elif expected_type == 131:  # SINT16
                                     base_type, size = FIT.BASE_TYPE['SINT16'], 2
-                                elif 0 <= dev_value <= 65535:
+                                elif expected_type == 132:  # UINT16
                                     base_type, size = FIT.BASE_TYPE['UINT16'], 2
-                                elif -2147483648 <= dev_value <= 2147483647:
+                                elif expected_type == 133:  # SINT32
                                     base_type, size = FIT.BASE_TYPE['SINT32'], 4
-                                else:
+                                elif expected_type == 134:  # UINT32
                                     base_type, size = FIT.BASE_TYPE['UINT32'], 4
-                            elif isinstance(dev_value, float):
-                                base_type, size = FIT.BASE_TYPE['FLOAT32'], 4
-                            elif isinstance(dev_value, list):
-                                # Handle arrays - use first non-None element for type determination
-                                sample_element = None
-                                for elem in dev_value:
-                                    if elem is not None:
-                                        sample_element = elem
-                                        break
-                                if sample_element is not None:
-                                    element_base_type, element_size = self._determine_field_type_and_size(None, sample_element)
-                                    size = len(dev_value) * FIT.BASE_TYPE_DEFINITIONS[element_base_type]['size']
-                                    base_type = element_base_type
+                                elif expected_type == 136:  # FLOAT32
+                                    base_type, size = FIT.BASE_TYPE['FLOAT32'], 4
+                                else:  # STRING or other
+                                    if isinstance(dev_value, str):
+                                        base_type, size = FIT.BASE_TYPE['STRING'], len(dev_value.encode('utf-8')) + 1
+                                    else:
+                                        base_type, size = FIT.BASE_TYPE['UINT8'], 1  # Default fallback
+                            else:
+                                # Fall back to original value-based type determination
+                                if isinstance(dev_value, str):
+                                    base_type, size = FIT.BASE_TYPE['STRING'], len(dev_value.encode('utf-8')) + 1
+                                elif isinstance(dev_value, bool):
+                                    base_type, size = FIT.BASE_TYPE['ENUM'], 1
+                                elif isinstance(dev_value, int):
+                                    if -128 <= dev_value <= 127:
+                                        base_type, size = FIT.BASE_TYPE['SINT8'], 1
+                                    elif 0 <= dev_value <= 255:
+                                        base_type, size = FIT.BASE_TYPE['UINT8'], 1
+                                    elif -32768 <= dev_value <= 32767:
+                                        base_type, size = FIT.BASE_TYPE['SINT16'], 2
+                                    elif 0 <= dev_value <= 65535:
+                                        base_type, size = FIT.BASE_TYPE['UINT16'], 2
+                                    elif -2147483648 <= dev_value <= 2147483647:
+                                        base_type, size = FIT.BASE_TYPE['SINT32'], 4
+                                    else:
+                                        base_type, size = FIT.BASE_TYPE['UINT32'], 4
+                                elif isinstance(dev_value, float):
+                                    base_type, size = FIT.BASE_TYPE['FLOAT32'], 4
+                                elif isinstance(dev_value, list):
+                                    # Handle arrays - use first non-None element for type determination
+                                    sample_element = None
+                                    for elem in dev_value:
+                                        if elem is not None:
+                                            sample_element = elem
+                                            break
+                                    if sample_element is not None:
+                                        element_base_type, element_size = self._determine_field_type_and_size(None, sample_element)
+                                        size = len(dev_value) * FIT.BASE_TYPE_DEFINITIONS[element_base_type]['size']
+                                        base_type = element_base_type
+                                    else:
+                                        base_type, size = FIT.BASE_TYPE['UINT8'], 1
                                 else:
                                     base_type, size = FIT.BASE_TYPE['UINT8'], 1
-                            else:
-                                base_type, size = FIT.BASE_TYPE['UINT8'], 1
                             
                             field_defs.append({
                                 'field_id': mapped_field_id,
