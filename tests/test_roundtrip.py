@@ -97,7 +97,7 @@ class TestRoundTrip:
             # Use exact same non-default settings as original read  
             new_messages, new_errors = new_decoder.read(**decode_settings)
 
-        assert len(new_errors) == 0, f"New file decoding errors: {new_errors}"
+        assert len(new_errors) == 0, f"New file decoding errors: {new_errors}. Output file saved at: {output_file}"
         assert len(new_messages) > 0, "New messages should not be empty"
         
         # Step 4: Compare original vs re-decoded messages

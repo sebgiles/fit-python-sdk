@@ -106,6 +106,12 @@ class Encoder:
 
     def _write_messages(self):
         '''Write all messages to the data buffer'''
+        # Pre-analyze all messages to determine consistent field types
+        all_messages = []
+        for messages in self._messages.values():
+            all_messages.extend(messages)
+        self.field_type_definitions = self._analyze_field_types_across_messages(all_messages)
+        
         # Write file_id message first (required by FIT spec)
         if 'file_id_mesgs' in self._messages:
             self._write_message_type(0, self._messages['file_id_mesgs'])
@@ -454,7 +460,8 @@ class Encoder:
                 field_value_counts[field_name]['total'] += 1
                 
                 # Check if value is meaningful (not default/invalid)
-                if field_value is not None and not self._is_default_value(field_value):
+                # For roundtrip compatibility, be less aggressive - only exclude completely empty fields
+                if field_value is not None:
                     field_value_counts[field_name]['meaningful'] += 1
         
         # Only include fields that have meaningful values in at least 10% of messages
@@ -543,8 +550,7 @@ class Encoder:
             
             # Determine field size and base type from sample message
             sample_value = sample_message[field_name]
-            base_type, size = self._determine_field_type_and_size(field_profile, sample_value)
-            
+            base_type, size = self._determine_field_type_and_size(field_profile, sample_value, field_name)
             field_defs.append({
                 'field_id': field_profile['num'],
                 'size': size,
@@ -738,10 +744,12 @@ class Encoder:
                         if not isinstance(sample_values_list, list):
                             sample_values_list = [sample_values_list]
                         
-                        # Use the first value as representative for profile-based fields
-                        # Profile fields should have consistent types
-                        sample_value = sample_values_list[0]
-                        base_type, size = self._determine_field_type_and_size(field_profile, sample_value)
+                        # Use the first non-None value as representative
+                        sample_value = next((val for val in sample_values_list if val is not None), None)
+                        if sample_value is None:
+                            continue
+                            
+                        base_type, size = self._determine_field_type_and_size(field_profile, sample_value, field_name)
                     else:
                         # Fallback to reasonable defaults based on field type
                         fit_type = field_profile.get('type', 'uint8')
@@ -768,20 +776,24 @@ class Encoder:
                 if not isinstance(sample_values_list, list):
                     sample_values_list = [sample_values_list]
                 
+                # Use the first non-None value as representative
+                sample_value = next((val for val in sample_values_list if val is not None), None)
+                if sample_value is None:
+                    continue
+                
                 # For arrays, check if they contain only None values
-                first_value = sample_values_list[0]
-                if isinstance(first_value, list):
-                    # This field contains arrays - need to flatten all values
+                if isinstance(sample_value, list):
+                    # This field contains arrays - need to flatten all values to determine type
                     all_array_values = []
-                    for array_val in sample_values_list:
-                        if isinstance(array_val, list):
-                            all_array_values.extend([v for v in array_val if v is not None])
+                    for sample_val in sample_values_list:
+                        if isinstance(sample_val, list):
+                            all_array_values.extend([v for v in sample_val if v is not None])
                     
                     if not all_array_values:
                         continue
                     
-                    # Use the first array as template for structure, but determine type from all values
-                    template_array = first_value
+                    # Use the sample_value array as template for structure
+                    template_array = sample_value
                     
                     # Determine type that can handle all values in all arrays
                     if all_array_values:
@@ -860,6 +872,12 @@ class Encoder:
         
         # Field definitions (3 bytes each)
         for field_def in field_defs:
+            # Validate base type before writing
+            if field_def['base_type'] not in FIT.BASE_TYPE_DEFINITIONS:
+                print(f"ERROR: Invalid base type {field_def['base_type']} for field {field_def['field_id']}")
+                print(f"Valid base types: {list(FIT.BASE_TYPE_DEFINITIONS.keys())}")
+                raise ValueError(f"Invalid base type {field_def['base_type']}")
+                
             self._data_buffer.append(field_def['field_id'])  # Field definition number
             self._data_buffer.append(field_def['size'])       # Size in bytes
             self._data_buffer.append(field_def['base_type'])  # Base type
@@ -922,6 +940,21 @@ class Encoder:
             else:
                 # Write actual field value
                 field_value = message[field_name]
+                
+                # Check if field type analysis says this should be an array
+                if hasattr(self, 'field_type_definitions') and field_name in self.field_type_definitions:
+                    field_def_info = self.field_type_definitions[field_name]
+                    
+                    if field_def_info['is_array'] and not isinstance(field_value, list):
+                        # Convert scalar to array with expected size
+                        array_size = field_def_info['array_size']
+                        field_value = [field_value] * array_size
+                        print(f"Converting scalar {field_value[0]} to array of size {array_size} for field {field_name}")
+                    elif not field_def_info['is_array'] and isinstance(field_value, list):
+                        # Convert array to scalar (use first element)
+                        field_value = field_value[0] if field_value else 0
+                        print(f"Converting array to scalar {field_value} for field {field_name}")
+                
                 # Look up field profile by searching for the field with matching name
                 field_profile = {}
                 for fid, finfo in msg_profile['fields'].items():
@@ -1078,11 +1111,46 @@ class Encoder:
         except (struct.error, ValueError):
             self._data_buffer.extend(b'\xFF' * size)
 
-    def _determine_field_type_and_size(self, field_profile: dict, field_value) -> tuple:
+    def _determine_field_type_and_size(self, field_profile: dict, field_value, field_name: str = None) -> tuple:
         '''Determine the base type and size for a field'''
         
         if field_value == 317:  # Debug specific case
             print(f"DEBUG: _determine_field_type_and_size called with value 317, profile: {field_profile}")
+        
+        # Check if this field has been pre-analyzed for array handling
+        if field_name and hasattr(self, 'field_type_definitions') and field_name in self.field_type_definitions:
+            field_def_info = self.field_type_definitions[field_name]
+            if field_def_info['is_array']:
+                # For arrays, determine element type and multiply by array size
+                array_size = field_def_info['array_size']
+                
+                # Use sample value to determine element type
+                if isinstance(field_value, list) and len(field_value) > 0:
+                    element_value = field_value[0]
+                else:
+                    element_value = field_value  # If it's a scalar, it will be converted later
+                
+                # Determine element base type
+                if isinstance(element_value, int):
+                    if 0 <= element_value <= 255:
+                        base_type = FIT.BASE_TYPE['UINT8']
+                        element_size = 1
+                    elif 0 <= element_value <= 65535:
+                        base_type = FIT.BASE_TYPE['UINT16']
+                        element_size = 2
+                    else:
+                        base_type = FIT.BASE_TYPE['UINT32']
+                        element_size = 4
+                elif isinstance(element_value, float):
+                    base_type = FIT.BASE_TYPE['FLOAT32']
+                    element_size = 4
+                else:
+                    base_type = FIT.BASE_TYPE['UINT8']
+                    element_size = 1
+                
+                total_size = array_size * element_size
+                print(f"Pre-analyzed field {field_name}: array_size={array_size}, element_size={element_size}, total_size={total_size}, base_type={base_type}")
+                return base_type, total_size
         
         # Handle developer fields (when field_profile is None)
         if field_profile is None:
@@ -1304,3 +1372,8 @@ class Encoder:
             'messages_key': str(message_type_num),
             'fields': fields
         }
+    
+    def _analyze_field_types_across_messages(self, messages):
+        """Pre-analyze all messages to determine consistent field types for specific problematic fields."""
+        # Disable pre-analysis to allow individual message field definitions
+        return {}
